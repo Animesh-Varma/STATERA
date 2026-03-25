@@ -153,7 +153,7 @@ def generate_statera_episode(dataset_file, episode_index):
 
 
 if __name__ == "__main__":
-    NUM_EPISODES = 15
+    NUM_EPISODES = 15  # Audit target. Full PoC target: 2000 episodes (Train: 1600, Val: 400)
     print(f"Initializing STATERA Pipeline (PyTorch Structuring for {NUM_EPISODES} episodes)...")
 
     with h5py.File("statera_poc.hdf5", "w") as f:
