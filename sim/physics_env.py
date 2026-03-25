@@ -2,11 +2,13 @@ import mujoco
 import numpy as np
 import h5py
 import albumentations as A
+import random
 from generator import generate_randomized_xml
 
-# Only applying Gaussian noise (Film Grain). Lens distortion is now handled natively in MuJoCo!
+# Domain Randomization pipeline
 frame_noise = A.Compose([
-    A.GaussNoise(std_range=(0.01, 0.04), p=0.8),
+    A.MotionBlur(blur_limit=(3, 7), p=0.5),
+    A.GaussNoise(std_range=(0.01, 0.04), p=0.8)  # This is correct for Albumentations v2.0+
 ])
 
 
@@ -14,6 +16,7 @@ def apply_episode_white_balance(frames):
     contrast = np.random.uniform(0.8, 1.2)
     brightness = np.random.uniform(-30, 30)
     r_shift, g_shift, b_shift = np.random.uniform(-20, 20, 3)
+
     processed = []
     for f in frames:
         f = f.astype(np.float32) * contrast + brightness
@@ -24,90 +27,157 @@ def apply_episode_white_balance(frames):
     return processed
 
 
-def project_3d_to_2d(model, data, cam_name="main_cam", resolution=224):
-    """Guaranteed mathematical perfection. No sub-pixel drifting."""
-    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+def project_3d_to_2d(model, data, camera_name="main_cam", resolution=224):
+    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[cam_id]
-    cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
     fovy = model.cam_fovy[cam_id]
 
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_object")
-    com_world = data.xipos[body_id]
+    com_world = data.xipos[body_id] # data.xipos is the true Cartesian CoM
 
+    # Get the true Rotation Matrix from Camera to World (3x3)
+    # MuJoCo updates this natively during mj_step/mj_forward, even for targetbody
+    cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
+
+    # Transform Center of Mass to Camera space (cam_mat.T is World-to-Camera)
     pt_cam = cam_mat.T @ (com_world - cam_pos)
+
     focal_length = 0.5 * resolution / np.tan(np.deg2rad(fovy) / 2)
 
+    # MuJoCo cameras look down the -Z axis. X is right, Y is up.
+    # U goes right, V goes down (Image coordinates)
     u = (pt_cam[0] / -pt_cam[2]) * focal_length + (resolution / 2)
-    v = (-pt_cam[1] / -pt_cam[2]) * focal_length + (resolution / 2)
+    v = (resolution / 2) - (pt_cam[1] / -pt_cam[2]) * focal_length
+
+    # Returns U, V, and the Positive Depth from the camera lens
     return float(u), float(v), float(-pt_cam[2])
 
 
-def generate_statera_episode(hdf5_file, episode_idx):
-    xml_str = generate_randomized_xml()
-    model = mujoco.MjModel.from_xml_string(xml_str)
+def generate_statera_episode(dataset_file, episode_index):
+    is_stable = random.random() < 0.5
+
+    xml_string = generate_randomized_xml(is_stable=is_stable)
+    model = mujoco.MjModel.from_xml_string(xml_string)
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, height=224, width=224)
 
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_object")
-    tracker_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "camera_tracker")
-    mocap_id = model.body_mocapid[tracker_id]
-    dof_start = model.body_dofadr[body_id]
+    try:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_object")
+        tracker_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "camera_tracker")
+        mocap_id = model.body_mocapid[tracker_id]
+        dof_start = model.body_dofadr[body_id]
 
-    data.qvel[dof_start: dof_start + 3] = np.random.uniform(-0.5, 0.5, 3)
-    data.qvel[dof_start + 3: dof_start + 6] = np.random.uniform(-15, 15, 3)
+        data.qvel[dof_start: dof_start + 3] = np.random.uniform(-1.0, 1.0, 3)
+        data.qvel[dof_start + 3: dof_start + 6] = np.random.uniform(-10.0, 10.0, 3)
 
-    mujoco.mj_forward(model, data)
-    data.mocap_pos[mocap_id] = data.xipos[body_id].copy()
+        mujoco.mj_forward(model, data)
+        data.mocap_pos[mocap_id] = data.xpos[body_id].copy()
 
-    frames, labels, z_heights = [], [], []
-    steady_wind = np.random.uniform(-0.5, 0.5, 3)
+        frames, labels, z_heights = [], [], []
 
-    for step in range(120):
-        data.xfrc_applied[body_id][:3] = steady_wind
+        for step in range(3000):
+            if step % 10 == 0:
+                t = data.time
+                obj_pos = data.xpos[body_id]
+                cam_target = data.mocap_pos[mocap_id]
 
-        t = data.time
-        obj_pos = data.xipos[body_id]
-        current_cam_target = data.mocap_pos[mocap_id]
+                if is_stable:
+                    new_target = cam_target + 0.08 * (obj_pos - cam_target)
+                    jitter = np.zeros(3)
+                else:
+                    new_target = cam_target + 0.25 * (obj_pos - cam_target)
+                    jitter = np.array([
+                        0.010 * np.sin(10 * t) + 0.005 * np.cos(23 * t),
+                        0.015 * np.cos(12 * t) + 0.005 * np.sin(27 * t),
+                        0.010 * np.sin(15 * t)
+                    ])
 
-        pan_speed = 0.15
-        new_target = current_cam_target + pan_speed * (obj_pos - current_cam_target)
+                data.mocap_pos[mocap_id] = new_target + jitter
 
-        jitter_x = 0.015 * np.sin(10 * t) + 0.005 * np.cos(23 * t)
-        jitter_y = 0.015 * np.cos(12 * t) + 0.005 * np.sin(27 * t)
-        jitter_z = 0.010 * np.sin(15 * t)
-        data.mocap_pos[mocap_id] = new_target + np.array([jitter_x, jitter_y, jitter_z])
-
-        for _ in range(5):
             mujoco.mj_step(model, data)
 
-        renderer.update_scene(data, camera="main_cam")
+            if step % 42 == 0:
+                renderer.update_scene(data, camera="main_cam")
+                frames.append(renderer.render().copy())
 
-        frames.append(renderer.render())
-        u, v, z = project_3d_to_2d(model, data)
-        labels.append([u, v, z])
-        z_heights.append(data.xipos[body_id][2])
+                u, v, z = project_3d_to_2d(model, data)
+                labels.append([u, v, z])
+                z_heights.append(data.xipos[body_id][2])
 
-    impact_frame = np.argmin(z_heights)
-    best_start = max(0, min(impact_frame - 6, len(frames) - 16))
+        impact_detected = False
+        impact_frame = 0
+        is_falling = False
 
-    best_frames = frames[best_start: best_start + 16]
-    best_labels = labels[best_start: best_start + 16]
+        for i in range(1, len(z_heights)):
+            dz = z_heights[i] - z_heights[i - 1]
+            if dz < -0.015:
+                is_falling = True
+            elif is_falling and dz > -0.002:
+                impact_frame = i
+                impact_detected = True
+                break
 
-    wb_frames = apply_episode_white_balance(best_frames)
+        if not impact_detected:
+            print(f"Ep {episode_index} FAILED: No valid impact. Retrying...")
+            return False  # Return False to trigger a retry loop
 
-    noisy_frames = []
-    for frame in wb_frames:
-        noisy_frames.append(frame_noise(image=frame)['image'])
+        best_start = max(0, min(impact_frame - 4, len(frames) - 16))
 
-    hdf5_file.create_dataset(f"video_{episode_idx}", data=np.array(noisy_frames, dtype=np.uint8), compression="lzf")
-    hdf5_file.create_dataset(f"label_{episode_idx}", data=np.array(best_labels, dtype=np.float32))
+        best_frames = frames[best_start: best_start + 16]
+        best_labels = np.array(labels[best_start: best_start + 16], dtype=np.float32)
 
-    print(f"Generated Episode {episode_idx} | Impact Frame Captured: {impact_frame}")
+        assert len(best_frames) == 16, f"Data size mismatch. Expected 16 frames, got {len(best_frames)}."
+
+        wb_frames = apply_episode_white_balance(best_frames)
+        noisy_frames = np.array([frame_noise(image=f)['image'] for f in wb_frames], dtype=np.uint8)
+
+        # Convert shape from (16, 224, 224, 3) to PyTorch layout (16, 3, 224, 224)
+        noisy_frames_pytorch = np.transpose(noisy_frames, (0, 3, 1, 2))
+
+        # Slice the labels into the exact structures requested
+        uv_coords = best_labels[:, :2]  # Shape: (16, 2)
+        z_depths = best_labels[:, 2:3]  # Shape: (16, 1)
+
+        # Insert directly into the pre-allocated HDF5 monolithic arrays
+        dataset_file["videos"][episode_index] = noisy_frames_pytorch
+        dataset_file["uv_coords"][episode_index] = uv_coords
+        dataset_file["z_depths"][episode_index] = z_depths
+
+        cam_mode = "STABLE" if is_stable else "CHAOTIC"
+        print(
+            f"Generated Ep {episode_index} | Cam: {cam_mode} | Impact Frame: {impact_frame} | Captured: {best_start} to {best_start + 16}")
+        return True
+
+    finally:
+        renderer.close()
 
 
 if __name__ == "__main__":
-    print("Initializing STATERA Pipeline (V3 - Mathematical Precision)...")
+    NUM_EPISODES = 15
+    print(f"Initializing STATERA Pipeline (PyTorch Structuring for {NUM_EPISODES} episodes)...")
+
     with h5py.File("statera_poc.hdf5", "w") as f:
-        for i in range(5):
-            generate_statera_episode(f, i)
-    print("V3 Dataset Generation Complete.")
+        f.create_dataset("videos",
+                         shape=(NUM_EPISODES, 16, 3, 224, 224),
+                         dtype=np.uint8,
+                         compression="lzf",
+                         chunks=(1, 16, 3, 224, 224))
+
+        f.create_dataset("uv_coords",
+                         shape=(NUM_EPISODES, 16, 2),
+                         dtype=np.float32,
+                         chunks=(1, 16, 2))
+
+        f.create_dataset("z_depths",
+                         shape=(NUM_EPISODES, 16, 1),
+                         dtype=np.float32,
+                         chunks=(1, 16, 1))
+
+
+        episodes_generated = 0
+        while episodes_generated < NUM_EPISODES:
+            success = generate_statera_episode(f, episodes_generated)
+            if success is not False:
+                episodes_generated += 1
+
+    print("Dataset Generation Complete.")
