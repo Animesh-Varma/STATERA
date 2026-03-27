@@ -27,7 +27,7 @@ def apply_episode_white_balance(frames):
     return processed
 
 
-def project_3d_to_2d(model, data, camera_name="main_cam", resolution=224):
+def project_3d_to_2d(model, data, camera_name="main_cam", resolution=384):
     cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[cam_id]
     fovy = model.cam_fovy[cam_id]
@@ -59,7 +59,7 @@ def generate_statera_episode(dataset_file, episode_index):
     xml_string = generate_randomized_xml(is_stable=is_stable)
     model = mujoco.MjModel.from_xml_string(xml_string)
     data = mujoco.MjData(model)
-    renderer = mujoco.Renderer(model, height=224, width=224)
+    renderer = mujoco.Renderer(model, height=384, width=384)
 
     try:
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_object")
@@ -131,7 +131,7 @@ def generate_statera_episode(dataset_file, episode_index):
         wb_frames = apply_episode_white_balance(best_frames)
         noisy_frames = np.array([frame_noise(image=f)['image'] for f in wb_frames], dtype=np.uint8)
 
-        # Convert shape from (16, 224, 224, 3) to PyTorch layout (16, 3, 224, 224)
+        # Convert shape from (16, 384, 384, 3) to PyTorch layout (16, 3, 384, 384)
         noisy_frames_pytorch = np.transpose(noisy_frames, (0, 3, 1, 2))
 
         # Slice the labels into the exact structures requested
@@ -153,15 +153,15 @@ def generate_statera_episode(dataset_file, episode_index):
 
 
 if __name__ == "__main__":
-    NUM_EPISODES = 15  # Audit target. Full PoC target: 2000 episodes (Train: 1600, Val: 400)
+    NUM_EPISODES = 2000  # Audit target. Full PoC target: 2000 episodes (Train: 1600, Val: 400)
     print(f"Initializing STATERA Pipeline (PyTorch Structuring for {NUM_EPISODES} episodes)...")
 
     with h5py.File("statera_poc.hdf5", "w") as f:
         f.create_dataset("videos",
-                         shape=(NUM_EPISODES, 16, 3, 224, 224),
+                         shape=(NUM_EPISODES, 16, 3, 384, 384),
                          dtype=np.uint8,
                          compression="lzf",
-                         chunks=(1, 16, 3, 224, 224))
+                         chunks=(1, 16, 3, 384, 384))
 
         f.create_dataset("uv_coords",
                          shape=(NUM_EPISODES, 16, 2),

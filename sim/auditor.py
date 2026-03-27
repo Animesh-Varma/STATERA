@@ -77,7 +77,7 @@ def audit_dataset(hdf5_path="statera_poc.hdf5"):
             heatmap_alpha = alpha_pct / 100.0
             frame_alpha = 1.0 - heatmap_alpha
 
-            heatmap_gray = generate_2d_gaussian_heatmap((224, 224), center=(u, v), sigma=sigma_val)
+            heatmap_gray = generate_2d_gaussian_heatmap((384, 384), center=(u, v), sigma=sigma_val)
             heatmap_color = cv2.applyColorMap(heatmap_gray, cv2.COLORMAP_JET)
 
             mask = (heatmap_gray > 10).astype(np.uint8)[:, :, np.newaxis]
@@ -103,7 +103,7 @@ def audit_dataset(hdf5_path="statera_poc.hdf5"):
                         (0, 255, 255) if is_slow_motion else (0, 255, 0), 2)
 
             # THE FIX: Using round() to prevent sub-pixel drift during 512x resize
-            scale_factor = 512 / 224.0
+            scale_factor = 512 / 384.0
             marker_x = int(round(u * scale_factor))
             marker_y = int(round(v * scale_factor))
 
