@@ -1,0 +1,14 @@
+# Requires Python 3.12
+mujoco
+numpy
+h5py
+opencv-python
+albumentations
+torch
+timm
+einops
+torchvision
+matplotlib
+fastapi
+uvicorn
+python-multipart
