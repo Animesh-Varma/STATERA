@@ -5,10 +5,9 @@ import albumentations as A
 import random
 from generator import generate_randomized_xml
 
-# Domain Randomization pipeline
 frame_noise = A.Compose([
-    A.MotionBlur(blur_limit=(3, 7), p=0.5),
-    A.GaussNoise(std_range=(0.01, 0.04), p=0.8)  # This is correct for Albumentations v2.0+
+    A.MotionBlur(blur_limit=(7, 21), p=0.8),
+    A.GaussNoise(std_range=(0.01, 0.04), p=0.7)
 ])
 
 
@@ -33,30 +32,29 @@ def project_3d_to_2d(model, data, camera_name="main_cam", resolution=384):
     fovy = model.cam_fovy[cam_id]
 
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_object")
-    com_world = data.xipos[body_id] # data.xipos is the true Cartesian CoM
+    com_world = data.xipos[body_id]
 
-    # Get the true Rotation Matrix from Camera to World (3x3)
-    # MuJoCo updates this natively during mj_step/mj_forward, even for targetbody
     cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
-
-    # Transform Center of Mass to Camera space (cam_mat.T is World-to-Camera)
     pt_cam = cam_mat.T @ (com_world - cam_pos)
 
     focal_length = 0.5 * resolution / np.tan(np.deg2rad(fovy) / 2)
 
-    # MuJoCo cameras look down the -Z axis. X is right, Y is up.
-    # U goes right, V goes down (Image coordinates)
     u = (pt_cam[0] / -pt_cam[2]) * focal_length + (resolution / 2)
     v = (resolution / 2) - (pt_cam[1] / -pt_cam[2]) * focal_length
 
-    # Returns U, V, and the Positive Depth from the camera lens
     return float(u), float(v), float(-pt_cam[2])
 
 
 def generate_statera_episode(dataset_file, episode_index):
-    is_stable = random.random() < 0.5
+    rand_mode = random.random()
+    if rand_mode < 0.35:
+        cam_mode = "STATIC"
+    elif rand_mode < 0.675:
+        cam_mode = "STABLE"
+    else:
+        cam_mode = "CHAOTIC"
 
-    xml_string = generate_randomized_xml(is_stable=is_stable)
+    xml_string = generate_randomized_xml(cam_mode=cam_mode)
     model = mujoco.MjModel.from_xml_string(xml_string)
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, height=384, width=384)
@@ -71,28 +69,39 @@ def generate_statera_episode(dataset_file, episode_index):
         data.qvel[dof_start + 3: dof_start + 6] = np.random.uniform(-10.0, 10.0, 3)
 
         mujoco.mj_forward(model, data)
-        data.mocap_pos[mocap_id] = data.xpos[body_id].copy()
+
+        if cam_mode == "STATIC":
+            mid_z = data.xpos[body_id][2] * np.random.uniform(0.2, 0.8)
+            lookat_offset = np.random.uniform(-0.6, 0.6, 3)
+            data.mocap_pos[mocap_id] = np.array([0.0, 0.0, mid_z]) + lookat_offset
+        else:
+            # Aggressive offset for mobile tracking
+            lookat_offset = np.random.uniform(-0.4, 0.4, 3)
+            data.mocap_pos[mocap_id] = data.xpos[body_id].copy() + lookat_offset
 
         frames, labels, z_heights = [], [], []
 
         for step in range(3000):
             if step % 10 == 0:
-                t = data.time
-                obj_pos = data.xpos[body_id]
-                cam_target = data.mocap_pos[mocap_id]
+                if cam_mode != "STATIC":
+                    t = data.time
+                    obj_pos = data.xpos[body_id]
+                    cam_target = data.mocap_pos[mocap_id]
 
-                if is_stable:
-                    new_target = cam_target + 0.08 * (obj_pos - cam_target)
-                    jitter = np.zeros(3)
-                else:
-                    new_target = cam_target + 0.25 * (obj_pos - cam_target)
-                    jitter = np.array([
-                        0.010 * np.sin(10 * t) + 0.005 * np.cos(23 * t),
-                        0.015 * np.cos(12 * t) + 0.005 * np.sin(27 * t),
-                        0.010 * np.sin(15 * t)
-                    ])
+                    target_with_offset = obj_pos + lookat_offset
 
-                data.mocap_pos[mocap_id] = new_target + jitter
+                    if cam_mode == "STABLE":
+                        new_target = cam_target + 0.08 * (target_with_offset - cam_target)
+                        jitter = np.zeros(3)
+                    else:  # CHAOTIC
+                        new_target = cam_target + 0.25 * (target_with_offset - cam_target)
+                        jitter = np.array([
+                            0.010 * np.sin(10 * t) + 0.005 * np.cos(23 * t),
+                            0.015 * np.cos(12 * t) + 0.005 * np.sin(27 * t),
+                            0.010 * np.sin(15 * t)
+                        ])
+
+                    data.mocap_pos[mocap_id] = new_target + jitter
 
             mujoco.mj_step(model, data)
 
@@ -118,43 +127,61 @@ def generate_statera_episode(dataset_file, episode_index):
                 break
 
         if not impact_detected:
-            print(f"Ep {episode_index} FAILED: No valid impact. Retrying...")
-            return False  # Return False to trigger a retry loop
+            # Silent fail, will naturally retry
+            return False, None, None
 
-        best_start = max(0, min(impact_frame - 4, len(frames) - 16))
+        # Randomize the impact frame placement within the 16-frame window (between index 3 and 12)
+        # This inherently randomizes the start and end times of the video slice
+        impact_offset = random.randint(3, 12)
+        best_start = impact_frame - impact_offset
+
+        # Make sure we actually have 16 valid frames after offsetting
+        if best_start < 0 or best_start + 16 > len(frames):
+            return False, None, None
 
         best_frames = frames[best_start: best_start + 16]
         best_labels = np.array(labels[best_start: best_start + 16], dtype=np.float32)
 
-        assert len(best_frames) == 16, f"Data size mismatch. Expected 16 frames, got {len(best_frames)}."
+        uv_coords = best_labels[:, :2]
+        z_depths = best_labels[:, 2:3]
+
+        # --- NEW VALIDATION: CoM bounds and depth safety ---
+        # If the CoM U/V coordinates leave the 384x384 image frame bounds, reject the episode.
+        if np.any(uv_coords[:, 0] < 0) or np.any(uv_coords[:, 0] > 384):
+            return False, None, None
+        if np.any(uv_coords[:, 1] < 0) or np.any(uv_coords[:, 1] > 384):
+            return False, None, None
+
+        # Reject if the CoM gets dangerously close to the camera lens (closer than 25 cm).
+        if np.any(z_depths < 0.25):
+            return False, None, None
 
         wb_frames = apply_episode_white_balance(best_frames)
         noisy_frames = np.array([frame_noise(image=f)['image'] for f in wb_frames], dtype=np.uint8)
 
-        # Convert shape from (16, 384, 384, 3) to PyTorch layout (16, 3, 384, 384)
         noisy_frames_pytorch = np.transpose(noisy_frames, (0, 3, 1, 2))
 
-        # Slice the labels into the exact structures requested
-        uv_coords = best_labels[:, :2]  # Shape: (16, 2)
-        z_depths = best_labels[:, 2:3]  # Shape: (16, 1)
-
-        # Insert directly into the pre-allocated HDF5 monolithic arrays
         dataset_file["videos"][episode_index] = noisy_frames_pytorch
         dataset_file["uv_coords"][episode_index] = uv_coords
         dataset_file["z_depths"][episode_index] = z_depths
 
-        cam_mode = "STABLE" if is_stable else "CHAOTIC"
-        print(
-            f"Generated Ep {episode_index} | Cam: {cam_mode} | Impact Frame: {impact_frame} | Captured: {best_start} to {best_start + 16}")
-        return True
+        print(f"Generated Ep {episode_index} | Cam: {cam_mode} | Impact Frame Index: {impact_offset}")
+        return True, cam_mode, impact_offset
 
     finally:
         renderer.close()
 
 
 if __name__ == "__main__":
-    NUM_EPISODES = 2000  # Audit target. Full PoC target: 2000 episodes (Train: 1600, Val: 400)
+    NUM_EPISODES = 5000
     print(f"Initializing STATERA Pipeline (PyTorch Structuring for {NUM_EPISODES} episodes)...")
+
+    stats = {
+        "attempts": 0,
+        "successes": 0,
+        "cam_modes": {"STATIC": 0, "STABLE": 0, "CHAOTIC": 0},
+        "impact_frames": []
+    }
 
     with h5py.File("statera_poc.hdf5", "w") as f:
         f.create_dataset("videos",
@@ -173,11 +200,53 @@ if __name__ == "__main__":
                          dtype=np.float32,
                          chunks=(1, 16, 1))
 
-
         episodes_generated = 0
         while episodes_generated < NUM_EPISODES:
-            success = generate_statera_episode(f, episodes_generated)
-            if success is not False:
+            stats["attempts"] += 1
+            success, mode, impact = generate_statera_episode(f, episodes_generated)
+            if success:
+                stats["successes"] += 1
+                stats["cam_modes"][mode] += 1
+                stats["impact_frames"].append(impact)
                 episodes_generated += 1
 
-    print("Dataset Generation Complete.")
+        print("\nDataset Generation Complete. Compiling Statistical Validation Report...")
+
+        # Pull the absolute ground truth straight from the finished HDF5 dataset
+        all_uv = f["uv_coords"][:]
+        all_z = f["z_depths"][:]
+
+        # U (Horizontal), V (Vertical)
+        mean_u, mean_v = np.mean(all_uv[:, :, 0]), np.mean(all_uv[:, :, 1])
+        std_u, std_v = np.std(all_uv[:, :, 0]), np.std(all_uv[:, :, 1])
+        min_u, max_u = np.min(all_uv[:, :, 0]), np.max(all_uv[:, :, 0])
+        min_v, max_v = np.min(all_uv[:, :, 1]), np.max(all_uv[:, :, 1])
+
+        mean_z = np.mean(all_z)
+        min_z, max_z = np.min(all_z), np.max(all_z)
+
+        avg_impact = np.mean(stats['impact_frames'])
+        rejection_rate = 1.0 - (stats['successes'] / stats['attempts'])
+
+        # Output the Report
+        print("\n" + "=" * 60)
+        print("STATERA DATASET GENERATION REPORT")
+        print("=" * 60)
+        print(f"Total Attempts   : {stats['attempts']}")
+        print(f"Total Successes  : {stats['successes']} episodes")
+        print(f"Rejection Rate   : {rejection_rate:.2%} (Out of bounds, no impact, etc.)")
+
+        print("\n🎥 CAMERA MODE DISTRIBUTION:")
+        for m, count in stats['cam_modes'].items():
+            print(f"  - {m:<8}: {count} ({count / stats['successes']:.1%})")
+
+        print(f"\n⚡ TEMPORAL VARIANCE:")
+        print(f"  - Avg Impact Frame : {avg_impact:.2f} (Allowed Range: 3 - 12)")
+
+        print("\n2D CENTER OF MASS SPREAD (Pixels):")
+        print(f"  - U (Horizontal) : Mean = {mean_u:^6.1f} | Std = {std_u:^5.1f} | Range = [{min_u:.1f}, {max_u:.1f}]")
+        print(f"  - V (Vertical)   : Mean = {mean_v:^6.1f} | Std = {std_v:^5.1f} | Range =[{min_v:.1f}, {max_v:.1f}]")
+
+        print("\nZ-DEPTH SPREAD (Meters from Camera Lens):")
+        print(f"  - Z-Depth        : Mean = {mean_z:^6.2f} | Range =[{min_z:.2f}, {max_z:.2f}]")
+        print("=" * 60 + "\n")
