@@ -5,20 +5,17 @@ import colorsys
 
 def get_contrasting_colors():
     hue_sky = random.random()
-
     hue_floor = (hue_sky + random.uniform(0.33, 0.66)) % 1.0
-
     hue_object = (hue_floor + random.uniform(0.33, 0.66)) % 1.0
 
     r_sky, g_sky, b_sky = colorsys.hsv_to_rgb(hue_sky, random.uniform(0.1, 0.3), random.uniform(0.6, 0.9))
-
     r_flr, g_flr, b_flr = colorsys.hsv_to_rgb(hue_floor, random.uniform(0.15, 0.35), random.uniform(0.2, 0.45))
-
     r_obj, g_obj, b_obj = colorsys.hsv_to_rgb(hue_object, random.uniform(0.7, 1.0), random.uniform(0.6, 0.9))
 
     return (f"{r_sky:.3f} {g_sky:.3f} {b_sky:.3f}",
             f"{r_flr:.3f} {g_flr:.3f} {b_flr:.3f}",
             f"{r_obj:.3f} {g_obj:.3f} {b_obj:.3f}")
+
 
 def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8):
     hx = max(0.001, size_x - radius)
@@ -95,30 +92,40 @@ def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z, com_x, com
     return f'fullinertia="{ix:.6f} {iy:.6f} {iz:.6f} {ixy:.6f} {ixz:.6f} {iyz:.6f}"'
 
 
-def generate_randomized_xml(is_stable=False):
+def generate_randomized_xml(cam_mode="STABLE"):
     gravity_z = np.random.uniform(-9.834, -9.764)
     air_density = np.random.uniform(1.1, 1.3)
 
     color_sky_rgb, color_floor_rgb, color_obj_rgb = get_contrasting_colors()
 
-    if is_stable:
-        radius = np.random.uniform(1.8, 2.4)
+    # Disable "close_target" generation if camera is meant to cover the whole static drop
+    is_close_target = random.random() < 0.15 and cam_mode != "STATIC"
+
+    if cam_mode == "STATIC":
+        radius = np.random.uniform(2.0, 4.5)
+        drop_height = np.random.uniform(2.0, 5.0)
+        camera_fovy = np.random.uniform(30, 55)
+    elif is_close_target:
+        radius = np.random.uniform(0.6, 1.3)
+        drop_height = np.random.uniform(1.0, 2.5)
+        camera_fovy = np.random.uniform(20, 35)
     else:
-        radius = np.random.uniform(1.3, 1.8)
+        if cam_mode == "STABLE":
+            radius = np.random.uniform(1.8, 2.4)
+        else:  # CHAOTIC
+            radius = np.random.uniform(1.3, 1.8)
+        drop_height = np.random.uniform(2.5, 4.5)
+        camera_fovy = np.random.uniform(20, 35)
 
     azimuth = np.random.uniform(0, 2 * np.pi)
     elevation = np.random.uniform(np.deg2rad(15), np.deg2rad(35))
-
-    drop_height = np.random.uniform(2.5, 4.5)
 
     camera_x = radius * np.cos(elevation) * np.cos(azimuth)
     camera_y = radius * np.cos(elevation) * np.sin(azimuth)
     camera_z = radius * np.sin(elevation) + (drop_height * 0.4)
 
-    camera_fovy = np.random.uniform(20, 30)
-
-    floor_texture = random.choices(["checker", "gradient", "flat"], weights=[0.1, 0.4, 0.5])[0]
-    object_texture = random.choices(["checker", "gradient", "flat"], weights=[0.35, 0.3, 0.35])[0]
+    floor_texture = random.choices(["checker", "gradient", "flat"], weights=[0.2, 0.4, 0.4])[0]
+    object_texture = random.choices(["checker", "gradient"], weights=[0.6, 0.4])[0]
 
     def random_gray():
         val = np.random.uniform(0.2, 0.8)
@@ -134,8 +141,9 @@ def generate_randomized_xml(is_stable=False):
     ramp_euler = f"0 {np.random.uniform(10, 25):.1f} 0"
     ramp_geometry = f'<geom name="ramp" type="box" size="1.5 1.5 0.1" pos="0 0 0.0" euler="{ramp_euler}" material="mat_ramp" solref="{soft_solref}" solimp="{soft_solimp}" friction="{fric_str}" margin="0.002"/>' if has_ramp else ""
 
+    # Distractors
     distractors_xml = ""
-    for _ in range(random.randint(1, 3)):
+    for _ in range(random.randint(1, 4)):
         dx, dy = np.random.uniform(-1.2, 1.2, 2)
         if abs(dx) < 0.4 and abs(dy) < 0.4: continue
         dtype = random.choice(["box", "cylinder", "sphere"])
@@ -143,25 +151,35 @@ def generate_randomized_xml(is_stable=False):
             size_str = "0.06 0.06 0.06"
         elif dtype == "cylinder":
             size_str = "0.06 0.06"
-        else: # sphere
+        else:  # sphere
             size_str = "0.06"
+
         distractors_xml += f"""
         <body pos="{dx:.3f} {dy:.3f} {np.random.uniform(1.0, 2.0):.3f}">
             <freejoint/>
-            <geom type="{dtype}" size="0.06 0.06 0.06" rgba="{random_gray()} 1" material="mat_bg" solref="{soft_solref}" solimp="{soft_solimp}" friction="{fric_str}" margin="0.002"/>
+            <geom type="{dtype}" size="{size_str}" rgba="{random_gray()} 1" material="mat_bg" solref="{soft_solref}" solimp="{soft_solimp}" friction="{fric_str}" margin="0.002"/>
         </body>
         """
 
     shape_type = random.choices(["box", "beveled_box", "cylinder", "ellipsoid"], weights=[0.35, 0.35, 0.15, 0.15])[0]
 
     if shape_type == "cylinder":
-        size_x = size_y = np.random.uniform(0.12, 0.22)
-        size_z = np.random.uniform(0.12, 0.22)
+        if is_close_target:
+            size_x = size_y = np.random.uniform(0.03, 0.08)
+            size_z = np.random.uniform(0.03, 0.08)
+        else:
+            size_x = size_y = np.random.uniform(0.12, 0.22)
+            size_z = np.random.uniform(0.12, 0.22)
         size_string = f"{size_x:.3f} {size_z:.3f}"
     else:
-        size_x = np.random.uniform(0.19, 0.32)
-        size_y = np.random.uniform(0.12, 0.22)
-        size_z = np.random.uniform(0.09, 0.17)
+        if is_close_target:
+            size_x = np.random.uniform(0.03, 0.08)
+            size_y = np.random.uniform(0.03, 0.08)
+            size_z = np.random.uniform(0.03, 0.08)
+        else:
+            size_x = np.random.uniform(0.19, 0.32)
+            size_y = np.random.uniform(0.12, 0.22)
+            size_z = np.random.uniform(0.09, 0.17)
         size_string = f"{size_x:.3f} {size_y:.3f} {size_z:.3f}"
 
     if shape_type == "beveled_box":
@@ -177,8 +195,6 @@ def generate_randomized_xml(is_stable=False):
     mass = np.random.uniform(1.5, 4.0)
     inertia_string = calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z, com_x, com_y, com_z)
 
-    drop_height = np.random.uniform(2.5, 4.5)
-
     xml_string = f"""
     <mujoco model="statera_poc">
         <compiler angle="degree" coordinate="local" balanceinertia="true"/>
@@ -192,16 +208,16 @@ def generate_randomized_xml(is_stable=False):
         <asset>
             {mesh_asset}
             <texture type="skybox" builtin="gradient" rgb1="{color_sky_rgb}" rgb2="0.05 0.05 0.05" width="512" height="512"/>
-            
-            <!-- Use Floor color for the ground and ramps -->
+
             <texture name="tex_floor" type="2d" builtin="{floor_texture}" rgb1="{color_floor_rgb}" rgb2="{random_gray()}" width="512" height="512"/>
             <texture name="tex_ramp" type="2d" builtin="flat" rgb1="{color_floor_rgb}" rgb2="{random_gray()}" width="512" height="512"/>
+
             <texture name="tex_obj" type="2d" builtin="{object_texture}" rgb1="{color_obj_rgb}" rgb2="{random_gray()}" width="512" height="512"/>
 
             <material name="mat_floor" texture="tex_floor" texrepeat="5 5" specular="0.2" shininess="0.1"/>
             <material name="mat_ramp" texture="tex_ramp" specular="0.1" shininess="0.1"/>
             <material name="mat_bg" specular="0.2" shininess="0.2"/>
-            <material name="mat_obj" texture="tex_obj" texrepeat="{random.randint(1, 4)} {random.randint(1, 4)}" texuniform="true" specular="0.6" shininess="0.8"/>
+            <material name="mat_obj" texture="tex_obj" texrepeat="{random.randint(1, 6)} {random.randint(1, 6)}" texuniform="true" specular="{np.random.uniform(0.3, 0.8):.2f}" shininess="{np.random.uniform(0.5, 0.9):.2f}"/>
         </asset>
 
         <worldbody>
@@ -210,8 +226,10 @@ def generate_randomized_xml(is_stable=False):
             </body>
             <camera name="main_cam" pos="{camera_x:.3f} {camera_y:.3f} {camera_z:.3f}" mode="targetbody" target="camera_tracker"/>
 
-            <light pos="{np.random.uniform(1.0, 3.0):.3f} 2 3" dir="-2 -2 -3" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3" castshadow="true"/>
-            <light pos="-2 -2 2" dir="2 2 -2" diffuse="0.3 0.3 0.4" castshadow="false"/>
+            <light pos="{np.random.uniform(1.0, 3.0):.3f} {np.random.uniform(1.0, 3.0):.3f} {np.random.uniform(2.5, 4.0):.3f}" 
+                   dir="-2 -2 -3" diffuse="{np.random.uniform(0.6, 1.0):.2f} {np.random.uniform(0.6, 1.0):.2f} {np.random.uniform(0.6, 1.0):.2f}" 
+                   specular="{np.random.uniform(0.2, 0.5):.2f} {np.random.uniform(0.2, 0.5):.2f} {np.random.uniform(0.2, 0.5):.2f}" castshadow="true"/>
+            <light pos="-2 -2 2" dir="2 2 -2" diffuse="{np.random.uniform(0.2, 0.5):.2f} {np.random.uniform(0.2, 0.5):.2f} {np.random.uniform(0.2, 0.5):.2f}" castshadow="false"/>
 
             <geom name="floor" type="plane" size="15 15 0.1" material="mat_floor" friction="{fric_str}" solref="{soft_solref}" solimp="{soft_solimp}"/>
 

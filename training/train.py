@@ -50,9 +50,9 @@ def run_training():
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
 
     BATCH_SIZE = 24
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=12, pin_memory=True,
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True,
                               prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=12, pin_memory=True,
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True,
                             prefetch_factor=2)
 
     model = StateraModel().to(device)
@@ -66,23 +66,37 @@ def run_training():
 
     print("STATERA PoC Training Started...")
 
-    # Limited to 2 Epochs
     epochs = 55
     best_val_loss = float('inf')
 
-    train_h_losses, train_z_losses = [], []
-    val_h_losses, val_z_losses = [], []
+    train_h_losses, train_z_losses = [],[]
+    val_h_losses, val_z_losses = [],[]
     global_start_time = time.time()
 
+    # Scheduler Settings
+    start_sigma = 12.5
+    end_sigma = 3.0
+    decay_epochs = 30
+
     for epoch in range(epochs):
+        # Calculate Target Sigma
+        if epoch < decay_epochs:
+            current_sigma = start_sigma - (start_sigma - end_sigma) * (epoch / decay_epochs)
+        else:
+            current_sigma = end_sigma
+
+        # Inject into dataset via PyTorch Subset parent (.dataset property)
+        # Note: Both train and val subsets share the same underlying base dataset instance.
+        train_dataset.dataset.update_sigma(current_sigma)
+
         epoch_start_time = time.time()
         model.train()
         running_h_loss, running_z_loss = 0.0, 0.0
         interval_start = time.time()
+        weight_z = 1.0
 
         for i, (vids, gt_h, gt_z) in enumerate(train_loader):
-            vids, gt_h, gt_z = vids.to(device, non_blocking=True), gt_h.to(device, non_blocking=True), gt_z.to(device,
-                                                                                                               non_blocking=True)
+            vids, gt_h, gt_z = vids.to(device, non_blocking=True), gt_h.to(device, non_blocking=True), gt_z.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             pred_h, pred_z = model(vids)
@@ -90,7 +104,7 @@ def run_training():
             loss_h = criterion_h(pred_h, gt_h)
             loss_z = criterion_z(pred_z, gt_z)
 
-            total_loss = loss_h + loss_z
+            total_loss = loss_h + (weight_z * loss_z)
 
             total_loss.backward()
             optimizer.step()
@@ -164,7 +178,8 @@ def run_training():
         true_video_error = avg_pixel_err * scale_factor
 
         epoch_time = time.time() - epoch_start_time
-        print(f"=== Epoch {epoch + 1} Completed in {epoch_time:.1f}s ===")
+        # Added tracking Sigma log so you can monitor the actual decay behavior on the console
+        print(f"=== Epoch {epoch + 1} Completed in {epoch_time:.1f}s | Sigma: {current_sigma:.2f} ===")
         print(f"Train - Heatmap: {avg_train_h:.4f} | Z-Depth: {avg_train_z:.4f}")
         print(f"Val   - Heatmap: {avg_val_h:.4f} | Z-Depth: {avg_val_z:.4f} {saved_flag}")
         print(

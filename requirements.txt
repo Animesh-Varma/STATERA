@@ -12,3 +12,4 @@ matplotlib
 fastapi
 uvicorn
 python-multipart
+opencv-contrib-python

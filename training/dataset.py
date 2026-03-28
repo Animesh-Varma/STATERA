@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import Dataset
 import h5py
-import numpy as np
 
 
 class StateraDataset(Dataset):
@@ -26,6 +25,10 @@ class StateraDataset(Dataset):
         )
         self.grid_x = x
         self.grid_y = y
+
+    def update_sigma(self, new_sigma):
+        """Setter to dynamically shrink the heatmap Gaussian width"""
+        self.sigma = new_sigma
 
     def __len__(self):
         return self.length
