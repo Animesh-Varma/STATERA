@@ -27,7 +27,7 @@ def ruthless_audit():
     model.load_state_dict(torch.load('best_statera_probe.pth', map_location=device, weights_only=True), strict=False)
     model.eval()
 
-    # Load Dataset (Using a fixed Sigma of 3.0 to test maximum precision)
+    # Load Dataset (Using a fixed Sigma of 3.0 to debug maximum precision)
     full_dataset = StateraDataset('../sim/statera_poc.hdf5', sigma=3.0)
 
     # ==========================================

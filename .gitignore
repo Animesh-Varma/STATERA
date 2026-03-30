@@ -1,3 +1,12 @@
 .idea/
 .venv/
 /sim/statera_poc.hdf5
+/sim2real/output/
+/sim2real/markers/
+/sim2real/data/
+/sim2real/calibration_data/
+/sim2real/debug/
+/sim2real/STATERA_Checkerboard.pdf
+/sim2real/variables.txt
+/sim2real/camera_matrix.npy
+/sim2real/dist_coeffs.npy
