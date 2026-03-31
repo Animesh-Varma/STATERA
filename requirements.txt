@@ -13,4 +13,8 @@ fastapi
 uvicorn
 python-multipart
 opencv-contrib-python
-Pillow
+pillow
+wandb
+moviepy
+imageio
+imageio-ffmpeg

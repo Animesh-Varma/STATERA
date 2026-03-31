@@ -1,8 +1,9 @@
 """
 3_extract_kinematics_batch.py
-Sim-to-Real Dataset Generator. Dynamically calculates exact 3D structural boundaries
-using user variables. Erases markers and maps the true invisible CoM.
-Now uses a 3.0x wide static crop to match the MuJoCo camera framing.
+Sim-to-Real Dataset Generator.
+*FINAL FIX*: Automatically translates MuJoCo (Z-Up) Center of Mass coordinates
+into OpenCV (Y-Down) coordinates AND inverts the X-axis to correct for
+physical ArUco face mirroring. Includes Scalar Magnitude extraction.
 """
 
 import cv2
@@ -10,6 +11,7 @@ import numpy as np
 import json
 import os
 import glob
+import math
 
 def get_var(key, prompt_msg, cast_type, default):
     config_file = 'variables.txt'
@@ -39,14 +41,17 @@ def get_var(key, prompt_msg, cast_type, default):
 
     return config[key]
 
+
 def process_directory():
     print("="*60)
-    print(" STATERA: Kinematics Batch Extraction Setup (Wide Perspective)")
+    print(" STATERA: Kinematics Batch Extraction Setup")
     print("="*60)
 
     marker_size_cm = get_var('marker_size_cm', 'Target black marker size in cm', float, 10.0)
-    box_size_cm = get_var('box_size_cm', 'Box dimensions X, Y, Z in cm (e.g. 15,15,15)', list, [15.0, 15.0, 15.0])
-    com_offset_cm = get_var('com_offset_cm', 'Hidden CoM offset X, Y, Z in cm', list, [4.0, -3.0, 5.0])
+    box_size_cm = get_var('box_size_cm', 'Box dimensions X, Y, Z in cm', list, [15.0, 15.0, 15.0])
+
+    # User inputs this based on MuJoCo
+    mujoco_com_offset_cm = get_var('com_offset_cm', 'MuJoCo Hidden CoM offset (X=Right, Y=Fwd, Z=Up) in cm', list, [4.0, -3.0, 5.0])
     max_frames = get_var('max_frames', 'Number of continuous frames to output per video', int, 16)
 
     input_dir = get_var('input_dir', 'Path to input video directory', str, 'data')
@@ -59,9 +64,22 @@ def process_directory():
         print(f"[!] No .mp4 files found in '{input_dir}'. Exiting.")
         return
 
-    bx, by, bz = [v / 100.0 for v in box_size_cm]
-    com_offset_m = [v / 100.0 for v in com_offset_cm]
+    # ==========================================
+    # FINAL COORDINATE FIX (Visualizer Verified)
+    # OpenCV Y-Down Mapping AND X-Axis Mirroring
+    # ==========================================
+    mj_x, mj_y, mj_z = [v / 100.0 for v in mujoco_com_offset_cm]
 
+    cv_x = -mj_x  # <- X-AXIS INVERTED TO MATCH PHYSICAL REALITY
+    cv_y = -mj_z  # <- Z-Up becomes Y-Down
+    cv_z = mj_y   # <- Y-Fwd becomes Z-Depth
+
+    opencv_com_offset_m = [cv_x, cv_y, cv_z]
+
+    # NEW: Calculate 3D Scalar Magnitude
+    true_com_mag_m = math.sqrt(cv_x**2 + cv_y**2 + cv_z**2)
+
+    bx, by, bz = [v / 100.0 for v in box_size_cm]
     hx, hy, hz = bx / 2, by / 2, bz / 2
     hm = (marker_size_cm / 100.0) / 2
 
@@ -96,9 +114,7 @@ def process_directory():
         print(f"\n[->] Scrubbing Video {v_idx + 1}/{len(video_files)}: {base_name}")
 
         cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"   [!] Cannot open {video_path}. Skipping.")
-            continue
+        if not cap.isOpened(): continue
 
         out_video_path = os.path.join(output_dir, f"{base_name}_statera.mp4")
         out_json_path = os.path.join(output_dir, f"{base_name}_benchmark.json")
@@ -107,7 +123,8 @@ def process_directory():
             "metadata": {
                 "source_video": base_name,
                 "box_size_m": [bx, by, bz],
-                "hidden_com_m": com_offset_m,
+                "hidden_com_m": opencv_com_offset_m,
+                "com_magnitude_m": true_com_mag_m, # Stored at top level
                 "resolution": [384, 384]
             },
             "frames": []
@@ -118,8 +135,7 @@ def process_directory():
 
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break # Video finished
+            if not ret: break
 
             corners, ids, _ = detector.detectMarkers(frame)
             detection_success = False
@@ -143,15 +159,13 @@ def process_directory():
                         mtx, dist
                     )
 
-                    com_3d = np.array([com_offset_m], dtype=np.float32)
+                    com_3d = np.array([opencv_com_offset_m], dtype=np.float32)
                     com_2d, _ = cv2.projectPoints(com_3d, rvec, tvec, mtx, dist)
                     com_u, com_v = com_2d[0][0]
 
                     clean_frame = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
-
                     box_2d, _ = cv2.projectPoints(box_3d, rvec, tvec, mtx, dist)
 
-                    # Store raw info in buffer; DO NOT crop frame-by-frame
                     continuous_buffer.append({
                         "clean_frame": clean_frame,
                         "box_2d": box_2d,
@@ -163,24 +177,19 @@ def process_directory():
                     })
                     detection_success = True
 
-            # If the streak is broken, wipe the buffer clean
             if not detection_success:
                 if len(continuous_buffer) > 0:
                     print(f"   [!] Lost tracking after {len(continuous_buffer)} frames. Resetting streak...")
                 continuous_buffer = []
 
-            # Stop scrubbing if we hit the magic number
             if len(continuous_buffer) == max_frames:
                 print(f"   [OK] Found continuous {max_frames}-frame chunk! Calculating static crop...")
                 break
-
             original_frame_count += 1
 
         cap.release()
 
-        # Final check: Calculate global sequence bounds and save data
         if len(continuous_buffer) == max_frames:
-            # 1. Determine the global bounds of the object across ALL buffered frames
             all_xs, all_ys = [], []
             for item in continuous_buffer:
                 all_xs.extend(item["box_2d"][:, 0, 0])
@@ -189,7 +198,6 @@ def process_directory():
             global_min_x, global_max_x = int(np.min(all_xs)), int(np.max(all_xs))
             global_min_y, global_max_y = int(np.min(all_ys)), int(np.max(all_ys))
 
-            # Calculate a single static center and target size for the entire sequence
             cx, cy = (global_min_x + global_max_x) // 2, (global_min_y + global_max_y) // 2
             max_dim = max(global_max_x - global_min_x, global_max_y - global_min_y)
 
@@ -216,7 +224,6 @@ def process_directory():
                 crop_canvas[cy1:cy2, cx1:cx2] = clean_frame[fy1:fy2, fx1:fx2]
                 final_frame = cv2.resize(crop_canvas, (384, 384), interpolation=cv2.INTER_AREA)
 
-                # Correct the coordinates for the CoM based on the static crop
                 scale = 384.0 / target_size
                 final_com_u = (item["com_u"] - x1) * scale
                 final_com_v = (item["com_v"] - y1) * scale
@@ -227,6 +234,7 @@ def process_directory():
                     "com_u": float(final_com_u),
                     "com_v": float(final_com_v),
                     "z_depth_meters": float(item["tvec"][2][0]),
+                    "com_magnitude_meters": float(true_com_mag_m), # Added to each frame
                     "rvec": item["rvec"].flatten().tolist(),
                     "tvec": item["tvec"].flatten().tolist()
                 }
@@ -235,13 +243,11 @@ def process_directory():
                 statera_data["frames"].append(frame_meta)
 
             out_video.release()
-
             with open(out_json_path, "w") as f:
                 json.dump(statera_data, f, indent=4)
-
             print(f"   [SUCCESS] Saved sequence to {out_video_path}")
         else:
-            print(f"   [ERROR] Reached end of {base_name} without finding {max_frames} continuous frames. Skipping output.")
+            print(f"   [ERROR] Skipping output.")
 
     print("\n[INFO] Batch processing complete!")
 

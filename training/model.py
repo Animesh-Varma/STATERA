@@ -3,8 +3,11 @@ import urllib.request
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import warnings
+
 warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 def ensure_vjepa_weights_exist():
     checkpoint_dir = Path(os.path.expanduser("~/.cache/torch/hub/checkpoints"))
@@ -12,7 +15,8 @@ def ensure_vjepa_weights_exist():
     checkpoint_path = checkpoint_dir / "vjepa2_1_vitl_dist_vitG_384.pt"
     if not checkpoint_path.exists():
         print("⚠️ Missing V-JEPA 2.1 weights. Downloading...")
-        urllib.request.urlretrieve("https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt", checkpoint_path)
+        urllib.request.urlretrieve("https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt",
+                                   checkpoint_path)
 
 
 ensure_vjepa_weights_exist()
@@ -32,11 +36,18 @@ class StateraModel(nn.Module):
 
         self.embed_dim = 1024
 
+        # Change 1B: Pooler explicitly focuses on the spatial token patches now
         self.pooler = nn.Sequential(
             nn.Linear(self.embed_dim, 256),
             nn.Tanh(),
             nn.Linear(256, 1),
-            nn.Softmax(dim=1)
+            nn.Softmax(dim=2)
+        )
+
+        # Change 1C: Conv1D operates strictly on the temporal series prior to funnel compression
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(in_channels=self.embed_dim, out_channels=self.embed_dim, kernel_size=3, padding=1),
+            nn.GELU()
         )
 
         self.funnel = nn.Sequential(
@@ -47,26 +58,41 @@ class StateraModel(nn.Module):
             nn.GELU()
         )
 
-        # Head A: Outputs raw mathematical logits
-        self.heatmap_head = nn.Sequential(
-            nn.Linear(256, heatmap_res * heatmap_res)
-        )
-
-        # Head B: Uncapped Meters
-        self.z_head = nn.Sequential(
-            nn.Linear(256, 1)
-        )
+        # Change 2: The Three Polar MLP Heads
+        self.heatmap_head = nn.Sequential(nn.Linear(256, heatmap_res * heatmap_res))
+        self.z_head = nn.Sequential(nn.Linear(256, 1))
+        self.mag_head = nn.Sequential(nn.Linear(256, 1))
 
     def forward(self, x):
         with torch.no_grad():
             tokens = self.backbone(x)
             if isinstance(tokens, tuple): tokens = tokens[0]
 
-        weights = self.pooler(tokens)
-        pooled = torch.sum(tokens * weights, dim=1)
+        B, L, C = tokens.shape
+        T_vjepa = 8
+        num_patches = L // T_vjepa
 
-        feat = self.funnel(pooled)
-        h_2d = self.heatmap_head(feat).view(-1, self.heatmap_res, self.heatmap_res)
+        # Change 1A: Explicit 4D segregation mapping [Batch, 8, 576, 1024]
+        tokens = tokens.view(B, T_vjepa, num_patches, C)
+
+        # Change 1B: Pool spatially across the 576 patches (dim=2)
+        weights = self.pooler(tokens) # [B, 8, num_patches, 1]
+        pooled = torch.sum(tokens * weights, dim=2)  # Output: [B, 8, 1024]
+
+        # Change 1C: Temporal Velocity Mapping
+        feat = pooled.transpose(1, 2)    # [B, 1024, 8]
+        feat = self.temporal_conv(feat)  # [B, 1024, 8]
+
+        # Change 1D: Temporal Upscale 8 -> 16 to sync with GT frames
+        feat = F.interpolate(feat, size=16, mode='linear', align_corners=False)  # [B, 1024, 16]
+        feat = feat.transpose(1, 2)  # [B, 16, 1024]
+
+        # Condense channel-space down
+        feat = self.funnel(feat)  # Output: [B, 16, 256]
+
+        # Execute Multi-Head routing
+        h_2d = self.heatmap_head(feat).view(B, 16, self.heatmap_res, self.heatmap_res)
         z = self.z_head(feat)
+        m = self.mag_head(feat)
 
-        return h_2d, z
+        return h_2d, z, m

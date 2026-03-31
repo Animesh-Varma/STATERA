@@ -2,7 +2,6 @@ import torch
 from torch.utils.data import Dataset
 import h5py
 
-
 class StateraDataset(Dataset):
     def __init__(self, h5_path, heatmap_res=64, sigma=12.5):
         self.h5_path = h5_path
@@ -14,6 +13,8 @@ class StateraDataset(Dataset):
             self.videos = f['videos'][:]
             self.uv_coords = f['uv_coords'][:]
             self.z_depths = f['z_depths'][:]
+            # Change 3: Extract magnitude cache
+            self.com_magnitudes = f['com_magnitudes'][:]
         print("✓ Dataset successfully cached in RAM!")
 
         self.length = len(self.videos)
@@ -34,22 +35,29 @@ class StateraDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
+        # [16, C, H, W] expected for 16-frame video
         video_np = self.videos[idx]
         video = torch.from_numpy(video_np).float() / 255.0
         video = video.permute(1, 0, 2, 3)
 
-        uv_np = self.uv_coords[idx].reshape(-1, 2)
-        u_val = float(uv_np[-1, 0])
-        v_val = float(uv_np[-1, 1])
+        # Extract 16 frames of coordinates
+        uv_np = self.uv_coords[idx].reshape(16, 2)
+        u_val = uv_np[:, 0]
+        v_val = uv_np[:, 1]
 
-        z_np = self.z_depths[idx].flatten()
-        z_val = float(z_np[-1])
-        z_depth = torch.tensor([z_val], dtype=torch.float32)
+        z_np = self.z_depths[idx].flatten() # [16]
+        z_depth = torch.tensor(z_np, dtype=torch.float32).view(16, 1)
+
+        # Change 3: Safely broadcast the static scalar magnitude across 16 timesteps
+        mag_val = float(self.com_magnitudes[idx].item())
+        com_mag = torch.full((16, 1), mag_val, dtype=torch.float32)
 
         scale = self.heatmap_res / 384.0
-        u_s, v_s = u_val * scale, v_val * scale
+        u_s = torch.tensor(u_val * scale, dtype=torch.float32).view(16, 1, 1)
+        v_s = torch.tensor(v_val * scale, dtype=torch.float32).view(16, 1, 1)
 
-        dist_sq = (self.grid_x - u_s) ** 2 + (self.grid_y - v_s) ** 2
+        # Broadcast grid subtraction across the 16 time steps: [16, 64, 64]
+        dist_sq = (self.grid_x.unsqueeze(0) - u_s) ** 2 + (self.grid_y.unsqueeze(0) - v_s) ** 2
         heatmap = torch.exp(-dist_sq / (2 * self.sigma ** 2))
 
-        return video, heatmap, z_depth
+        return video, heatmap, z_depth, com_mag

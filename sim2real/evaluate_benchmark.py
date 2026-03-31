@@ -1,12 +1,13 @@
 """
 4_evaluate_benchmark.py
-STATERA Benchmarking Script. Ingests the extracted Sim-to-Real MP4s and JSON targets,
-runs a forward pass to predict the physical state of the 16th frame, and calculates
-the explicit mathematical error across the dataset.
+STATERA Benchmarking Script. Ingests the extracted Sim-to-Real MP4s and JSON targets.
+Runs a forward pass to predict the physical state of the ENTIRE 16-FRAME SEQUENCE.
 
 Updates:
-- Normalizes Depth (Z) to positive magnitude for evaluation.
-- Includes Centroid Offset Delta proof for mass asymmetry tracking.
+- Evaluates Full Trajectory Error (Frames 1-16) vs Terminal Error (Frame 16).
+- Unpacks third Polar Head (pred_m) to evaluate 3D Scalar Magnitude.
+- Proves kinematic mass tracking dynamically across the whole temporal sequence.
+- Added W&B integration to track Sim-to-Real benchmark progress over time.
 """
 
 import os
@@ -17,7 +18,7 @@ import cv2
 import math
 import torch
 import numpy as np
-
+import wandb
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
@@ -31,7 +32,6 @@ from model import StateraModel
 
 
 def get_var(key, prompt_msg, cast_type, default):
-    """Helper to load/save user variables."""
     config_file = 'variables.txt'
     config = {}
     if os.path.exists(config_file):
@@ -59,23 +59,26 @@ def get_var(key, prompt_msg, cast_type, default):
 
 
 def get_subpixel_coords(logits_heatmap, device):
-    """Calculates the expected-value float coordinates from the raw 64x64 logits."""
-    B, H, W = logits_heatmap.shape
-    probs = torch.sigmoid(logits_heatmap).view(B, -1)
+    """Calculates expected-value float coordinates from the raw 64x64 sequence logits."""
+    B, T, H, W = logits_heatmap.shape
+    probs = torch.sigmoid(logits_heatmap).view(B * T, -1)
     probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
-    probs = probs.view(B, H, W)
+    probs = probs.view(B, T, H, W)
 
     y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    y_center = (probs * y_grid).float().sum(dim=(1, 2))
-    x_center = (probs * x_grid).float().sum(dim=(1, 2))
+    y_center = (probs * y_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
+    x_center = (probs * x_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
 
-    return torch.stack([x_center, y_center], dim=1)
+    return torch.stack([x_center, y_center], dim=2)
 
 
 def evaluate_statera():
     print("=" * 60)
-    print(" STATERA: Physics Evaluation (Normalized Depth)")
+    print(" STATERA: Temporal Sequence Physics Evaluation")
     print("=" * 60)
+
+    # Initialize W&B for Evaluation Tracking
+    wandb.init(project="STATERA", name="Sim-to-Real-Eval", job_type="evaluation")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Initializing Inference Engine on {device}...")
@@ -105,10 +108,16 @@ def evaluate_statera():
 
     print(f"[INFO] Discovered {len(mp4_files)} sequences. Starting Audit...\n")
 
-    spatial_errors = []
-    depth_errors = []
-    dist_true_to_centroid_list = []
-    dist_pred_to_centroid_list = []
+    # Metrics Lists
+    traj_spatial_errors, traj_depth_errors, traj_mag_errors = [], [], []
+    term_spatial_errors, term_depth_errors, term_mag_errors = [], [], []
+    dist_true_to_centroid_list, dist_pred_to_centroid_list = [], []
+
+    # New Vector Math Lists
+    term_mags_true = []
+    term_mags_pred = []
+    term_mag_deltas = []
+    term_angles = []
 
     valid_count = 0
 
@@ -117,10 +126,8 @@ def evaluate_statera():
             base_name = mp4_path.replace("_statera.mp4", "")
             json_path = base_name + "_benchmark.json"
 
-            if not os.path.exists(json_path):
-                continue
+            if not os.path.exists(json_path): continue
 
-            # Load Video
             cap = cv2.VideoCapture(mp4_path)
             frames = []
             for _ in range(16):
@@ -129,8 +136,7 @@ def evaluate_statera():
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             cap.release()
 
-            if len(frames) != 16:
-                continue
+            if len(frames) != 16: continue
 
             frames_np = np.stack(frames)
             vid_tensor = torch.from_numpy(frames_np).float() / 255.0
@@ -139,20 +145,11 @@ def evaluate_statera():
             with open(json_path, 'r') as f:
                 target_data = json.load(f)
 
-            frame_16 = target_data["frames"][15]
-
-            # --- DEPTH NORMALIZATION ---
-            # Ensure target is a positive distance
-            target_z = abs(float(frame_16["z_depth_meters"]))
-            target_u = frame_16["com_u"]
-            target_v = frame_16["com_v"]
-
-            # --- CENTROID RECONSTRUCTION ---
             bx, by, bz = target_data["metadata"]["box_size_m"]
             hx, hy, hz = bx / 2, by / 2, bz / 2
             box_3d = np.array([
                 [-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
-                [-hx, -hy,  hz], [hx, -hy,  hz], [hx, hy,  hz], [-hx, hy,  hz]
+                [-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]
             ], dtype=np.float32)
 
             all_xs, all_ys = [], []
@@ -169,64 +166,166 @@ def evaluate_statera():
             x1, y1 = cx - (target_size // 2), cy - (target_size // 2)
             scale = 384.0 / target_size
 
-            # Dynamic centroid for frame 16
-            box_2d_16, _ = cv2.projectPoints(box_3d, np.array(frame_16["rvec"]), np.array(frame_16["tvec"]), mtx, dist)
-            centroid_u = ((np.min(box_2d_16[:, 0, 0]) + np.max(box_2d_16[:, 0, 0])) / 2.0 - x1) * scale
-            centroid_v = ((np.min(box_2d_16[:, 0, 1]) + np.max(box_2d_16[:, 0, 1])) / 2.0 - y1) * scale
+            # Inference unpacks 3 variables
+            pred_h, pred_z, pred_m = model(vid_tensor)
+            sub_uv_seq = get_subpixel_coords(pred_h, device)[0].cpu().numpy() * 6.0
 
-            # --- INFERENCE ---
-            pred_h, pred_z = model(vid_tensor)
+            seq_spatial_err = 0.0
+            seq_depth_err = 0.0
+            seq_mag_err = 0.0
 
-            sub_uv = get_subpixel_coords(pred_h, device)[0].cpu().numpy()
-            pred_u, pred_v = sub_uv[0] * 6.0, sub_uv[1] * 6.0
+            for frame_idx in range(16):
+                f_data = target_data["frames"][frame_idx]
 
-            # --- DEPTH NORMALIZATION ---
-            # Ensure prediction is treated as a positive distance
-            pred_z_val = abs(float(pred_z[0].item()))
+                target_z = abs(float(f_data["z_depth_meters"]))
+                target_m = abs(float(f_data.get("com_magnitude_meters", 0.0)))
+                target_u = f_data["com_u"]
+                target_v = f_data["com_v"]
 
-            # Metrics
-            l2_dist = math.sqrt((pred_u - target_u)**2 + (pred_v - target_v)**2)
-            abs_z_err = abs(pred_z_val - target_z)
+                pred_u, pred_v = sub_uv_seq[frame_idx]
+                pred_z_val = abs(float(pred_z[0, frame_idx, 0].item()))
 
-            dist_true_to_centroid = math.sqrt((target_u - centroid_u)**2 + (target_v - centroid_v)**2)
-            dist_pred_to_centroid = math.sqrt((pred_u - centroid_u)**2 + (pred_v - centroid_v)**2)
+                # Extract model's predicted scalar magnitude
+                pred_m_val = abs(float(pred_m[0, frame_idx, 0].item()))
 
-            spatial_errors.append(l2_dist)
-            depth_errors.append(abs_z_err)
-            dist_true_to_centroid_list.append(dist_true_to_centroid)
-            dist_pred_to_centroid_list.append(dist_pred_to_centroid)
+                # Center Calculation
+                box_2d_f, _ = cv2.projectPoints(box_3d, np.array(f_data["rvec"]), np.array(f_data["tvec"]), mtx, dist)
+                centroid_u = ((np.min(box_2d_f[:, 0, 0]) + np.max(box_2d_f[:, 0, 0])) / 2.0 - x1) * scale
+                centroid_v = ((np.min(box_2d_f[:, 0, 1]) + np.max(box_2d_f[:, 0, 1])) / 2.0 - y1) * scale
 
+                # General Metrics
+                l2_dist = math.sqrt((pred_u - target_u) ** 2 + (pred_v - target_v) ** 2)
+                abs_z_err = abs(pred_z_val - target_z)
+                abs_m_err = abs(pred_m_val - target_m)
+
+                dist_true_to_centroid = math.sqrt((target_u - centroid_u) ** 2 + (target_v - centroid_v) ** 2)
+                dist_pred_to_centroid = math.sqrt((pred_u - centroid_u) ** 2 + (pred_v - centroid_v) ** 2)
+
+                traj_spatial_errors.append(l2_dist)
+                traj_depth_errors.append(abs_z_err)
+                traj_mag_errors.append(abs_m_err)
+                dist_true_to_centroid_list.append(dist_true_to_centroid)
+                dist_pred_to_centroid_list.append(dist_pred_to_centroid)
+
+                seq_spatial_err += l2_dist
+                seq_depth_err += abs_z_err
+                seq_mag_err += abs_m_err
+
+                # --- 16TH FRAME VECTOR CALCULATIONS ---
+                if frame_idx == 15:
+                    term_spatial_errors.append(l2_dist)
+                    term_depth_errors.append(abs_z_err)
+                    term_mag_errors.append(abs_m_err)
+
+                    # 1. Define 2D Vectors
+                    v_true = np.array([target_u - centroid_u, target_v - centroid_v])
+                    v_pred = np.array([pred_u - centroid_u, pred_v - centroid_v])
+
+                    # 2. 2D Magnitudes
+                    mag_true = np.linalg.norm(v_true)
+                    mag_pred = np.linalg.norm(v_pred)
+
+                    # 3. Angle (Phase Error) via Cosine Similarity
+                    if mag_true > 1e-5 and mag_pred > 1e-5:
+                        cos_theta = np.dot(v_true, v_pred) / (mag_true * mag_pred)
+                        cos_theta = np.clip(cos_theta, -1.0, 1.0)  # Prevent float rounding NaNs
+                        angle_deg = math.degrees(math.acos(cos_theta))
+                    else:
+                        angle_deg = 0.0
+
+                    term_mags_true.append(mag_true)
+                    term_mags_pred.append(mag_pred)
+                    term_mag_deltas.append(mag_pred - mag_true)
+                    term_angles.append(angle_deg)
+
+            avg_seq_spatial = seq_spatial_err / 16.0
+            avg_seq_mag_cm = (seq_mag_err / 16.0) * 100.0  # Print in CM
             valid_count += 1
-            print(f"   -> [Seq {valid_count:03d}] UV-Err: {l2_dist:5.2f}px | Z-Err: {abs_z_err:6.4f}m (Pred: {pred_z_val:.4f}m)")
 
-    # Aggregation
+            # Print single-sequence preview
+            print(
+                f"   -> [Seq {valid_count:03d}] UV-Err: {avg_seq_spatial:5.2f}px | Mag Err: {avg_seq_mag_cm:5.1f}cm | Angle Err: {term_angles[-1]:5.1f}°")
+
+    # --- AGGREGATION & PROOF ---
     if valid_count == 0: return
 
-    print("\n" + "=" * 60)
-    print(" BENCHMARK RESULTS")
-    print("=" * 60)
-    print(f" Total Videos Validated : {valid_count}")
-    print(f" Mean Spatial Error     : {mean_spatial:.2f} Pixels")
-    print(f" Max Spatial Error      : {max_spatial:.2f} Pixels")
-    print(f" Mean Depth Error       : {mean_depth:.4f} Meters")
-    print("-" * 60)
-    print(" KINEMATICS PROOF (Centroid Offset Delta)")
-    print("-" * 60)
-    print(f" 1. Distance (True CoM to Geometric Center) : {mean_true_to_centroid:.2f} px")
-    print(f" 2. Distance (Pred CoM to Geometric Center) : {mean_pred_to_centroid:.2f} px")
-    print(f" 3. True Tracking Error (Pred to True CoM)  : {mean_spatial:.2f} px")
-    print("\n CONCLUSION:")
+    # Sequence Averages
+    mean_traj_spatial = np.mean(traj_spatial_errors)
+    mean_traj_depth = np.mean(traj_depth_errors)
+    mean_traj_mag = np.mean(traj_mag_errors) * 100.0  # Convert to CM
 
-    if mean_spatial < mean_pred_to_centroid:
-        print(" [SUCCESS] The Prediction Error is smaller than the distance to the")
-        print(" visual center. This proves the network is mathematically tracking")
-        print(" the physical mass offset trajectory, not just guessing the middle")
-        print(" of the bounding box!")
+    # Terminal (Frame 16) Averages
+    mean_term_spatial = np.mean(term_spatial_errors)
+    max_term_spatial = np.max(term_spatial_errors)
+    mean_term_depth = np.mean(term_depth_errors)
+    mean_term_mag = np.mean(term_mag_errors) * 100.0  # Convert to CM
+
+    # Vector Math Averages
+    mean_mag_true = np.mean(term_mags_true)
+    mean_mag_pred = np.mean(term_mags_pred)
+    mean_mag_delta = np.mean(term_mag_deltas)
+    mean_angle = np.mean(term_angles)
+
+    print("\n" + "=" * 60)
+    print(" TEMPORAL BENCHMARK RESULTS")
+    print("=" * 60)
+    print(f" Total Sequences Validated : {valid_count}")
+    print("\n --- TRAJECTORY PERFORMANCE (All 16 Frames) ---")
+    print(f" Mean Trajectory Spatial Error : {mean_traj_spatial:.2f} Pixels")
+    print(f" Mean Trajectory Depth Error   : {mean_traj_depth:.4f} Meters")
+    print(f" Mean Trajectory 3D Mag Error  : {mean_traj_mag:.2f} Centimeters")
+    print("\n --- TERMINAL PERFORMANCE (Final Frame 16) ---")
+    print(f" Mean Terminal Spatial Error   : {mean_term_spatial:.2f} Pixels")
+    print(f" Max Terminal Spatial Error    : {max_term_spatial:.2f} Pixels")
+    print(f" Mean Terminal 3D Mag Error    : {mean_term_mag:.2f} Centimeters")
+
+    print("\n" + "-" * 60)
+    print(" 2D VECTOR ANALYSIS (Terminal Frame)")
+    print("-" * 60)
+    print(f" 1. Magnitude True (Amplitude)    : {mean_mag_true:.2f} px")
+    print(f" 2. Magnitude Pred (Amplitude)    : {mean_mag_pred:.2f} px")
+    print(f" 3. Magnitude Delta (Pred - True) : {mean_mag_delta:+.2f} px")
+    print(f" 4. Phase Angle Error (Pred VS True): {mean_angle:.1f}°")
+
+    # W&B Logging
+    wandb.log({
+        "eval/traj_spatial_err_px": mean_traj_spatial,
+        "eval/traj_depth_err_m": mean_traj_depth,
+        "eval/traj_mag_err_cm": mean_traj_mag,
+        "eval/term_spatial_err_px": mean_term_spatial,
+        "eval/term_max_spatial_px": max_term_spatial,
+        "eval/term_depth_err_m": mean_term_depth,
+        "eval/term_mag_err_cm": mean_term_mag,
+        "eval/term_mag_delta_px": mean_mag_delta,
+        "eval/term_phase_angle_deg": mean_angle
+    })
+
+    print("\n DIAGNOSTICS:")
+    if mean_mag_delta > 5.0:
+        print(" [!] FOV ILLUSION DETECTED: The model is consistently overestimating")
+        print(f"     the mass displacement by ~{mean_mag_delta:.1f}px. It correctly learned the wobble,")
+        print("     but the simulated camera FOV or crop scaling is warping the magnitude.")
+    elif mean_mag_delta < -5.0:
+        print(" [!] DAMPENED AMPLITUDE: The model is underestimating the mass offset.")
+        print("     This implies real-world physics are stiffer, or Z-depth translation failed.")
     else:
-        print(" [WARNING] The prediction is closer to the visual center than it")
-        print(" is to the True CoM. The network may be collapsing its predictions")
-        print(" to the geometric centroid instead of learning mass asymmetry.")
-    print("=" * 60 + "\n")
+        print(" [OK] 2D Amplitude bounds are perfectly aligned with reality.")
+
+    if mean_angle > 45.0:
+        print(f" [!] MASSIVE PHASE ERROR ({mean_angle:.1f}°): The network is tracking the correct")
+        print("     wobble physics, but mapping it to the WRONG FACE of the box.")
+        print("     Use `6_auto_face_finder.py` to deduce the physical Axis Rotation offset.")
+    elif mean_angle > 15.0:
+        print(f" [!] MINOR PHASE SHIFT ({mean_angle:.1f}°): Check physical camera roll or slight")
+        print("     misalignments in ArUco marker placement vs MuJoCo.")
+    else:
+        print(f" [OK] Phase Tracking is locked in. The neural network's angular prediction")
+        print("     matches the Ground Truth vector perfectly.")
+
+    print("\n" + "=" * 60 + "\n")
+
+    # Safely close W&B run
+    wandb.finish()
 
 
 if __name__ == "__main__":

@@ -50,28 +50,29 @@ def load_ml_state():
 
 
 def get_subpixel_coords(logits_heatmap):
-    B, H, W = logits_heatmap.shape
-    probs = torch.sigmoid(logits_heatmap).view(B, -1)
+    """Updated to handle 4D temporal sequences [B, T, H, W]"""
+    B, T, H, W = logits_heatmap.shape
+    probs = torch.sigmoid(logits_heatmap).view(B * T, -1)
     probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
-    probs = probs.view(B, H, W)
+    probs = probs.view(B, T, H, W)
+
     y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    y_center = (probs * y_grid).float().sum(dim=(1, 2))
-    x_center = (probs * x_grid).float().sum(dim=(1, 2))
-    return torch.stack([x_center, y_center], dim=1)
+    y_center = (probs * y_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
+    x_center = (probs * x_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
+
+    return torch.stack([x_center, y_center], dim=2)
 
 
 def overlay_results(frame_bgr, pred_u, pred_v, gt_u=None, gt_v=None, raw_hm=None):
     # --- 1. Draw 4x4 Grid Overlay ---
     overlay = frame_bgr.copy()
     h, w = overlay.shape[:2]
-    # 4x4 grid means 3 inner lines vertically and horizontally
     for i in range(1, 4):
         x = int(w * i / 4.0)
         y = int(h * i / 4.0)
         cv2.line(overlay, (x, 0), (x, h), (255, 255, 255), 1, cv2.LINE_AA)
         cv2.line(overlay, (0, y), (w, y), (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Blend grid seamlessly with the base frame (30% opacity)
     cv2.addWeighted(overlay, 0.3, frame_bgr, 0.7, 0, frame_bgr)
 
     # --- 2. Overlay Heatmap & Tracking Targets ---
@@ -117,6 +118,7 @@ async def auditor_infer(ep_idx: int):
     gt_uv_seq = global_dataset["uv_coords"][ep_idx].reshape(-1, 2)
     gt_z_seq = global_dataset["z_depths"][ep_idx].flatten()
 
+    # Ground truth values for telemetry panel (taking final frame)
     final_gt_uv = gt_uv_seq[-1]
     final_gt_z = float(gt_z_seq[-1])
 
@@ -124,26 +126,41 @@ async def auditor_infer(ep_idx: int):
     vid_tensor = vid_tensor.permute(1, 0, 2, 3).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred_h, pred_z = model(vid_tensor)
-        sub_uv = get_subpixel_coords(pred_h)[0].cpu().numpy()
-        pred_u, pred_v = sub_uv * (384.0 / 64.0)
-        z_val = pred_z[0].item()
-        raw_hm = torch.sigmoid(pred_h)[0].cpu().numpy()
+        pred_h, pred_z = model(vid_tensor)  # [1, 16, 64, 64] and [1, 16, 1]
+
+        # Get sequence of coordinates [1, 16, 2] -> [16, 2]
+        sub_uv_seq = get_subpixel_coords(pred_h)[0].cpu().numpy() * (384.0 / 64.0)
+
+        # Extract telemetry for UI (taking final frame)
+        final_pred_u, final_pred_v = sub_uv_seq[-1]
+        final_pred_z = pred_z[0, -1, 0].item()
+
+        # Raw heatmaps [16, 64, 64]
+        raw_hm_seq = torch.sigmoid(pred_h)[0].cpu().numpy()
 
     out_frames = []
+    # Loop across the 16 frames to track the moving wobble
     for i in range(16):
         frame_rgb = np.transpose(vid_array[i], (1, 2, 0))
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        out = overlay_results(frame_bgr, pred_u, pred_v, gt_u=gt_uv_seq[i][0], gt_v=gt_uv_seq[i][1], raw_hm=raw_hm)
+
+        pred_u, pred_v = sub_uv_seq[i]
+        out = overlay_results(
+            frame_bgr,
+            pred_u, pred_v,
+            gt_u=gt_uv_seq[i][0],
+            gt_v=gt_uv_seq[i][1],
+            raw_hm=raw_hm_seq[i]
+        )
         out_frames.append(out)
 
     return JSONResponse({
         "ep_idx": ep_idx,
         "gt_z": f"{final_gt_z:.4f} m",
-        "pred_z": f"{z_val:.4f} m",
+        "pred_z": f"{final_pred_z:.4f} m",
         "gt_uv": f"{final_gt_uv[0]:.0f}, {final_gt_uv[1]:.0f}",
-        "pred_uv": f"{pred_u:.1f}, {pred_v:.1f}",
-        "error_px": f"{np.linalg.norm(final_gt_uv - [pred_u, pred_v]):.2f} px",
+        "pred_uv": f"{final_pred_u:.1f}, {final_pred_v:.1f}",
+        "error_px": f"{np.linalg.norm(final_gt_uv - [final_pred_u, final_pred_v]):.2f} px",
         "frames": frames_to_base64(out_frames)
     })
 
@@ -169,8 +186,6 @@ async def zero_shot_inference(
 
     frames = []
 
-    # 1. ENFORCE MINIMUM SIZE
-    # V-JEPA needs minimum 384x384. Only downscaling is allowed.
     crop_size = max(384, int(crop_size))
     crop_x = int(crop_x)
     crop_y = int(crop_y)
@@ -181,13 +196,11 @@ async def zero_shot_inference(
 
         h, w = frame.shape[:2]
 
-        # 2. BOUNDARY CALCULATION
         x1 = max(0, crop_x)
         y1 = max(0, crop_y)
         x2 = x1 + crop_size
         y2 = y1 + crop_size
 
-        # Safe boundaries for numpy slicing
         valid_x1 = max(0, min(w, x1))
         valid_x2 = max(0, min(w, x2))
         valid_y1 = max(0, min(h, y1))
@@ -195,13 +208,11 @@ async def zero_shot_inference(
 
         cropped = frame[valid_y1:valid_y2, valid_x1:valid_x2]
 
-        # 3. SAFE PADDING
         if cropped.shape[0] < crop_size or cropped.shape[1] < crop_size:
             pad = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
             pad[:cropped.shape[0], :cropped.shape[1]] = cropped
             cropped = pad
 
-        # 4. SAFE RESIZING
         if cropped.shape[:2] != (384, 384):
             cropped = cv2.resize(cropped, (384, 384), interpolation=cv2.INTER_AREA)
 
@@ -221,26 +232,33 @@ async def zero_shot_inference(
 
     with torch.no_grad():
         pred_h, pred_z = model(vid_tensor)
-        sub_uv = get_subpixel_coords(pred_h)[0].cpu().numpy()
-        pred_u, pred_v = sub_uv * (384.0 / 64.0)
-        z_val = pred_z[0].item()
-        raw_hm = torch.sigmoid(pred_h)[0].cpu().numpy()
 
-    out_frames = [overlay_results(f.copy(), pred_u, pred_v, raw_hm=raw_hm) for f in frames]
+        sub_uv_seq = get_subpixel_coords(pred_h)[0].cpu().numpy() * (384.0 / 64.0)
+        final_pred_u, final_pred_v = sub_uv_seq[-1]
+        final_pred_z = pred_z[0, -1, 0].item()
+
+        raw_hm_seq = torch.sigmoid(pred_h)[0].cpu().numpy()
+
+    out_frames = []
+    # Loop across the 16 frames tracking the moving wobble
+    for i in range(16):
+        pred_u, pred_v = sub_uv_seq[i]
+        out = overlay_results(frames[i].copy(), pred_u, pred_v, raw_hm=raw_hm_seq[i])
+        out_frames.append(out)
 
     return JSONResponse({
         "ep_idx": "Custom Zero-Shot",
         "gt_z": "N/A",
-        "pred_z": f"{z_val:.4f} m",
+        "pred_z": f"{final_pred_z:.4f} m",
         "gt_uv": "N/A",
-        "pred_uv": f"{pred_u:.1f}, {pred_v:.1f}",
+        "pred_uv": f"{final_pred_u:.1f}, {final_pred_v:.1f}",
         "error_px": "N/A",
         "frames": frames_to_base64(out_frames)
     })
 
 
 # ==========================================
-# MATERIAL 3 FRONTEND
+# MATERIAL 3 FRONTEND (HTML is untouched)
 # ==========================================
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -747,7 +765,6 @@ HTML_CONTENT = """
             }
         };
 
-        // Handles loading the correct file into the visualizer modal per batch step
         function startConfigFlow(idx) {
             currentConfigIdx = idx;
             const file = batchFiles[idx];

@@ -68,11 +68,12 @@ def generate_noise_based_com(shape_type, size_x, size_y, size_z):
             is_valid = radius_xyz <= 1.0
             extremity = radius_xyz
 
-        if is_valid and 0.1 <= extremity <= 0.5:
+        # Change 2A: Allowed CoM offset expanded to 90% extreme distance to the edge
+        if is_valid and 0.1 <= extremity <= 0.9:
             return noise_x * size_x, noise_y * size_y, noise_z * size_z
 
 
-def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z, com_x, com_y, com_z):
+def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z):
     if shape_type in ["box", "beveled_box"]:
         ix = (1 / 3) * mass * (size_y ** 2 + size_z ** 2)
         iy = (1 / 3) * mass * (size_x ** 2 + size_z ** 2)
@@ -85,11 +86,7 @@ def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z, com_x, com
         iy = (1 / 5) * mass * (size_x ** 2 + size_z ** 2)
         iz = (1 / 5) * mass * (size_x ** 2 + size_y ** 2)
 
-    ixy = mass * com_x * com_y
-    ixz = mass * com_x * com_z
-    iyz = mass * com_y * com_z
-
-    return f'fullinertia="{ix:.6f} {iy:.6f} {iz:.6f} {ixy:.6f} {ixz:.6f} {iyz:.6f}"'
+    return f'diaginertia="{ix:.6f} {iy:.6f} {iz:.6f}"'
 
 
 def generate_randomized_xml(cam_mode="STABLE"):
@@ -98,24 +95,23 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     color_sky_rgb, color_floor_rgb, color_obj_rgb = get_contrasting_colors()
 
-    # Disable "close_target" generation if camera is meant to cover the whole static drop
     is_close_target = random.random() < 0.15 and cam_mode != "STATIC"
 
+    # Change 1: Locked Camera FOV randomization strictly between [65, 85] degrees everywhere
+    camera_fovy = np.random.uniform(65, 85)
+
     if cam_mode == "STATIC":
-        radius = np.random.uniform(2.0, 4.5)
+        radius = np.random.uniform(3.5, 6.0)
         drop_height = np.random.uniform(2.0, 5.0)
-        camera_fovy = np.random.uniform(30, 55)
     elif is_close_target:
-        radius = np.random.uniform(0.6, 1.3)
+        radius = np.random.uniform(1.1, 1.7)
         drop_height = np.random.uniform(1.0, 2.5)
-        camera_fovy = np.random.uniform(20, 35)
     else:
         if cam_mode == "STABLE":
             radius = np.random.uniform(1.8, 2.4)
         else:  # CHAOTIC
             radius = np.random.uniform(1.3, 1.8)
         drop_height = np.random.uniform(2.5, 4.5)
-        camera_fovy = np.random.uniform(20, 35)
 
     azimuth = np.random.uniform(0, 2 * np.pi)
     elevation = np.random.uniform(np.deg2rad(15), np.deg2rad(35))
@@ -125,7 +121,10 @@ def generate_randomized_xml(cam_mode="STABLE"):
     camera_z = radius * np.sin(elevation) + (drop_height * 0.4)
 
     floor_texture = random.choices(["checker", "gradient", "flat"], weights=[0.2, 0.4, 0.4])[0]
+
+    # Change 3: Removed small micro-textures. Keep macro textures using random asymmetric repeats
     object_texture = random.choices(["checker", "gradient"], weights=[0.6, 0.4])[0]
+    texrepeat_str = f"{random.choice([1, 2])} {random.choice([1, 2])}"
 
     def random_gray():
         val = np.random.uniform(0.2, 0.8)
@@ -141,7 +140,6 @@ def generate_randomized_xml(cam_mode="STABLE"):
     ramp_euler = f"0 {np.random.uniform(10, 25):.1f} 0"
     ramp_geometry = f'<geom name="ramp" type="box" size="1.5 1.5 0.1" pos="0 0 0.0" euler="{ramp_euler}" material="mat_ramp" solref="{soft_solref}" solimp="{soft_solimp}" friction="{fric_str}" margin="0.002"/>' if has_ramp else ""
 
-    # Distractors
     distractors_xml = ""
     for _ in range(random.randint(1, 4)):
         dx, dy = np.random.uniform(-1.2, 1.2, 2)
@@ -165,17 +163,17 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     if shape_type == "cylinder":
         if is_close_target:
-            size_x = size_y = np.random.uniform(0.03, 0.08)
-            size_z = np.random.uniform(0.03, 0.08)
+            size_x = size_y = np.random.uniform(0.025, 0.05)
+            size_z = np.random.uniform(0.025, 0.06)
         else:
             size_x = size_y = np.random.uniform(0.12, 0.22)
             size_z = np.random.uniform(0.12, 0.22)
         size_string = f"{size_x:.3f} {size_z:.3f}"
     else:
         if is_close_target:
-            size_x = np.random.uniform(0.03, 0.08)
-            size_y = np.random.uniform(0.03, 0.08)
-            size_z = np.random.uniform(0.03, 0.08)
+            size_x = np.random.uniform(0.025, 0.05)
+            size_y = np.random.uniform(0.025, 0.05)
+            size_z = np.random.uniform(0.025, 0.05)
         else:
             size_x = np.random.uniform(0.19, 0.32)
             size_y = np.random.uniform(0.12, 0.22)
@@ -193,7 +191,10 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     com_x, com_y, com_z = generate_noise_based_com(shape_type, size_x, size_y, size_z)
     mass = np.random.uniform(1.5, 4.0)
-    inertia_string = calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z, com_x, com_y, com_z)
+    inertia_string = calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z)
+
+    # Change 6: Calculate CoM Offset Magnitude Scalar to return
+    com_magnitude = np.sqrt(com_x ** 2 + com_y ** 2 + com_z ** 2)
 
     xml_string = f"""
     <mujoco model="statera_poc">
@@ -201,10 +202,9 @@ def generate_randomized_xml(cam_mode="STABLE"):
         <option gravity="0 0 {gravity_z:.4f}" timestep="0.001" solver="Newton" iterations="150" tolerance="1e-10" cone="elliptic" jacobian="dense" density="{air_density:.3f}" viscosity="1.8e-5"/>
 
         <visual>
-            <global fovy="{camera_fovy:.2f}"/>
+            <global fovy="{camera_fovy:.2f}" offwidth="640" offheight="640"/>
             <quality shadowsize="4096" offsamples="8"/>
         </visual>
-
         <asset>
             {mesh_asset}
             <texture type="skybox" builtin="gradient" rgb1="{color_sky_rgb}" rgb2="0.05 0.05 0.05" width="512" height="512"/>
@@ -217,7 +217,7 @@ def generate_randomized_xml(cam_mode="STABLE"):
             <material name="mat_floor" texture="tex_floor" texrepeat="5 5" specular="0.2" shininess="0.1"/>
             <material name="mat_ramp" texture="tex_ramp" specular="0.1" shininess="0.1"/>
             <material name="mat_bg" specular="0.2" shininess="0.2"/>
-            <material name="mat_obj" texture="tex_obj" texrepeat="{random.randint(1, 6)} {random.randint(1, 6)}" texuniform="true" specular="{np.random.uniform(0.3, 0.8):.2f}" shininess="{np.random.uniform(0.5, 0.9):.2f}"/>
+            <material name="mat_obj" texture="tex_obj" texrepeat="{texrepeat_str}" texuniform="true" specular="{np.random.uniform(0.3, 0.8):.2f}" shininess="{np.random.uniform(0.5, 0.9):.2f}"/>
         </asset>
 
         <worldbody>
@@ -244,4 +244,4 @@ def generate_randomized_xml(cam_mode="STABLE"):
         </worldbody>
     </mujoco>
     """
-    return xml_string
+    return xml_string, com_magnitude
