@@ -27,16 +27,13 @@ def apply_episode_white_balance(frames):
     return processed
 
 
-def project_3d_to_2d(model, data, camera_name="main_cam", resolution=640):
+def project_point_to_2d(model, data, point_3d, camera_name="main_cam", resolution=640):
     cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[cam_id]
     fovy = model.cam_fovy[cam_id]
 
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_object")
-    com_world = data.xipos[body_id]
-
     cam_mat = data.cam_xmat[cam_id].reshape(3, 3)
-    pt_cam = cam_mat.T @ (com_world - cam_pos)
+    pt_cam = cam_mat.T @ (point_3d - cam_pos)
 
     focal_length = 0.5 * resolution / np.tan(np.deg2rad(fovy) / 2)
 
@@ -44,6 +41,41 @@ def project_3d_to_2d(model, data, camera_name="main_cam", resolution=640):
     v = (resolution / 2) - (pt_cam[1] / -pt_cam[2]) * focal_length
 
     return float(u), float(v), float(-pt_cam[2])
+
+
+# NEW: Calculates the dynamic 2D screen footprint of the 3D bounding box
+def get_projected_bbox_area(model, data, camera_name="main_cam", resolution=640):
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "shell")
+    geom_type = model.geom_type[geom_id]
+    size = model.geom_size[geom_id]
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+        sx, sy, sz = size[0], size[0], size[1]
+    else:
+        sx, sy, sz = size[0], size[1], size[2]
+        if sx == 0 and sy == 0 and sz == 0:
+            # Fallback AABB for custom meshes
+            sx = sy = sz = model.geom_rbound[geom_id]
+
+    corners_local = np.array([
+        [ sx,  sy,  sz], [ sx,  sy, -sz], [ sx, -sy,  sz], [ sx, -sy, -sz],
+        [-sx,  sy,  sz], [-sx,  sy, -sz], [-sx, -sy,  sz], [-sx, -sy, -sz]
+    ])
+
+    geom_pos = data.geom_xpos[geom_id]
+    geom_mat = data.geom_xmat[geom_id].reshape(3, 3)
+    corners_world = geom_pos + corners_local @ geom_mat.T
+
+    us, vs = [], []
+    for pt in corners_world:
+        u, v, z = project_point_to_2d(model, data, pt, camera_name=camera_name, resolution=resolution)
+        if z <= 0.15:  # Immediately reject if a corner comes within 15cm of the lens (will break projection)
+            return float('inf')
+        us.append(u)
+        vs.append(v)
+
+    area = (max(us) - min(us)) * (max(vs) - min(vs))
+    return area
 
 
 def generate_statera_episode(dataset_file, episode_index):
@@ -59,7 +91,6 @@ def generate_statera_episode(dataset_file, episode_index):
     model = mujoco.MjModel.from_xml_string(xml_string)
     data = mujoco.MjData(model)
 
-    # Change 4: Render at a larger resolution (640x640) initially for static cropping
     renderer = mujoco.Renderer(model, height=640, width=640)
 
     try:
@@ -68,9 +99,8 @@ def generate_statera_episode(dataset_file, episode_index):
         mocap_id = model.body_mocapid[tracker_id]
         dof_start = model.body_dofadr[body_id]
 
-        # Change 2B: Inject violent initial angular velocity (spin) across X, Y, Z
-        data.qvel[dof_start: dof_start + 3] = np.random.uniform(-1.0, 1.0, 3)  # Linear
-        data.qvel[dof_start + 3: dof_start + 6] = np.random.uniform(-25.0, 25.0, 3)  # Extreme Angular Spin
+        data.qvel[dof_start: dof_start + 3] = np.random.uniform(-1.0, 1.0, 3)
+        data.qvel[dof_start + 3: dof_start + 6] = np.random.uniform(-25.0, 25.0, 3)
 
         mujoco.mj_forward(model, data)
 
@@ -82,7 +112,7 @@ def generate_statera_episode(dataset_file, episode_index):
             lookat_offset = np.random.uniform(-0.4, 0.4, 3)
             data.mocap_pos[mocap_id] = data.xpos[body_id].copy() + lookat_offset
 
-        frames, labels, z_heights = [], [], []
+        frames, labels, geom_centers, z_heights = [], [], [], []
 
         for step in range(3000):
             if step % 10 == 0:
@@ -110,12 +140,23 @@ def generate_statera_episode(dataset_file, episode_index):
                 return False, None, None, None, None
 
             if step % 42 == 0:
+                # NEW: Dynamic rejection if the object exceeds 75% of a 384x384 box (110,592 pixels)
+                bbox_area = get_projected_bbox_area(model, data, resolution=640)
+                if bbox_area > 110592:
+                    return False, None, None, None, None
+
                 renderer.update_scene(data, camera="main_cam")
                 frames.append(renderer.render().copy())
 
-                u, v, z = project_3d_to_2d(model, data, resolution=640)
-                labels.append([u, v, z])
-                z_heights.append(data.xipos[body_id][2])
+                com_world = data.xipos[body_id]
+                u_com, v_com, z_com = project_point_to_2d(model, data, com_world, resolution=640)
+                labels.append([u_com, v_com, z_com])
+
+                geom_world = data.xpos[body_id]
+                u_geom, v_geom, z_geom = project_point_to_2d(model, data, geom_world, resolution=640)
+                geom_centers.append([u_geom, v_geom, z_geom])
+
+                z_heights.append(com_world[2])
 
         impact_detected = False
         impact_frame = 0
@@ -141,32 +182,35 @@ def generate_statera_episode(dataset_file, episode_index):
 
         best_frames = frames[best_start: best_start + 16]
         best_labels = np.array(labels[best_start: best_start + 16], dtype=np.float32)
+        best_geoms = np.array(geom_centers[best_start: best_start + 16], dtype=np.float32)
 
         uv_coords = best_labels[:, :2]
         z_depths = best_labels[:, 2:3]
+        box_center_uv = best_geoms[:, :2]
 
-        # Change 4: Static Global Bounding Box Cropping (Preserves absolute Optical Geometric Z-scale)
         min_u, max_u = np.min(uv_coords[:, 0]), np.max(uv_coords[:, 0])
         min_v, max_v = np.min(uv_coords[:, 1]), np.max(uv_coords[:, 1])
 
-        # Reject if the trajectory visually drifts off a 384 window entirely
         if (max_u - min_u) > 360 or (max_v - min_v) > 360:
             return False, None, None, None, None
 
-        # Center the crop relative to the trajectory midpoint
-        crop_u = int((min_u + max_u) / 2.0 - 192)
-        crop_v = int((min_v + max_v) / 2.0 - 192)
+        if random.random() < 0.5:
+            crop_u = int((min_u + max_u) / 2.0 - 192)
+            crop_v = int((min_v + max_v) / 2.0 - 192)
+        else:
+            crop_u = (640 - 384) // 2
+            crop_v = (640 - 384) // 2
 
-        # Pad protection (clamp box within [0, 640-384])
         crop_u = max(0, min(crop_u, 640 - 384))
         crop_v = max(0, min(crop_v, 640 - 384))
 
-        # Perform the static crop for the entire 16-frame sequence
         cropped_frames = [f[crop_v:crop_v + 384, crop_u:crop_u + 384, :] for f in best_frames]
 
-        # Translate relative coordinates
         uv_coords[:, 0] -= crop_u
         uv_coords[:, 1] -= crop_v
+
+        box_center_uv[:, 0] -= crop_u
+        box_center_uv[:, 1] -= crop_v
 
         if np.any(uv_coords[:, 0] < 0) or np.any(uv_coords[:, 0] > 384):
             return False, None, None, None, None
@@ -183,7 +227,8 @@ def generate_statera_episode(dataset_file, episode_index):
         dataset_file["videos"][episode_index] = noisy_frames_pytorch
         dataset_file["uv_coords"][episode_index] = uv_coords
         dataset_file["z_depths"][episode_index] = z_depths
-        dataset_file["com_magnitudes"][episode_index] = com_mag  # Change 6: Appending Scalar Loss Head
+        dataset_file["com_magnitudes"][episode_index] = com_mag
+        dataset_file["box_center_uv"][episode_index] = box_center_uv
 
         print(f"Generated Ep {episode_index} | Cam: {cam_mode} | Impact Frame Index: {impact_offset}")
         return True, cam_mode, impact_offset, com_mag, noisy_frames_pytorch
@@ -193,10 +238,9 @@ def generate_statera_episode(dataset_file, episode_index):
 
 
 if __name__ == "__main__":
-    NUM_EPISODES = 10000
+    NUM_EPISODES = 1000
     print(f"Initializing STATERA Pipeline (PyTorch Structuring for {NUM_EPISODES} episodes)...")
 
-    # Change 5: W&B Implementation for Job Versioning and Distribution Checks
     wandb.init(project="STATERA-DataGen", job_type="generation")
 
     stats = {
@@ -223,11 +267,15 @@ if __name__ == "__main__":
                          dtype=np.float32,
                          chunks=(1, 16, 1))
 
-        # Change 6: Target Header Initialization
         f.create_dataset("com_magnitudes",
                          shape=(NUM_EPISODES, 1),
                          dtype=np.float32,
                          chunks=(1, 1))
+
+        f.create_dataset("box_center_uv",
+                         shape=(NUM_EPISODES, 16, 2),
+                         dtype=np.float32,
+                         chunks=(1, 16, 2))
 
         episodes_generated = 0
         video_buffer = []
@@ -242,7 +290,6 @@ if __name__ == "__main__":
                 stats["impact_frames"].append(impact)
                 com_mag_list.append(float(com_mag))
 
-                # Change 5: Buffer 5 videos out of every 1,000 to send off to wandb.
                 if episodes_generated % 1000 < 5:
                     video_buffer.append(frames_pt)
 
@@ -255,7 +302,6 @@ if __name__ == "__main__":
                     })
                     video_buffer = []
 
-        # Change 5: Visual Check on Extracted Physics Distrbution
         wandb.log({"com_magnitude_distribution": wandb.Histogram(com_mag_list)})
 
         print("\nDataset Generation Complete. Compiling Statistical Validation Report...")
@@ -279,7 +325,7 @@ if __name__ == "__main__":
         print("=" * 60)
         print(f"Total Attempts   : {stats['attempts']}")
         print(f"Total Successes  : {stats['successes']} episodes")
-        print(f"Rejection Rate   : {rejection_rate:.2%} (Out of bounds, no impact, NaN safety catch)")
+        print(f"Rejection Rate   : {rejection_rate:.2%} (Screen coverage >75%, OOB, NaN catches)")
 
         print("\n🎥 CAMERA MODE DISTRIBUTION:")
         for m, count in stats['cam_modes'].items():

@@ -10,6 +10,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 # Import your model architecture
 from model import StateraModel
@@ -64,7 +65,6 @@ def get_subpixel_coords(logits_heatmap):
 
 
 def overlay_results(frame_bgr, pred_u, pred_v, gt_u=None, gt_v=None, raw_hm=None):
-    # --- 1. Draw 4x4 Grid Overlay ---
     overlay = frame_bgr.copy()
     h, w = overlay.shape[:2]
     for i in range(1, 4):
@@ -75,7 +75,6 @@ def overlay_results(frame_bgr, pred_u, pred_v, gt_u=None, gt_v=None, raw_hm=None
 
     cv2.addWeighted(overlay, 0.3, frame_bgr, 0.7, 0, frame_bgr)
 
-    # --- 2. Overlay Heatmap & Tracking Targets ---
     if raw_hm is not None:
         hm_resized = cv2.resize(raw_hm, (frame_bgr.shape[1], frame_bgr.shape[0]))
         hm_vis = np.uint8(255 * (hm_resized / (hm_resized.max() + 1e-8)))
@@ -88,8 +87,8 @@ def overlay_results(frame_bgr, pred_u, pred_v, gt_u=None, gt_v=None, raw_hm=None
         cv2.circle(frame_bgr, (int(gt_u), int(gt_v)), 2, (255, 255, 255), -1, cv2.LINE_AA)
 
     cx, cy = int(pred_u), int(pred_v)
-    cv2.drawMarker(frame_bgr, (cx, cy), (255, 200, 0), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
-    cv2.circle(frame_bgr, (cx, cy), 1, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.drawMarker(frame_bgr, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+    cv2.circle(frame_bgr, (cx, cy), 2, (255, 255, 255), -1, cv2.LINE_AA)
     return frame_bgr
 
 
@@ -109,6 +108,58 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="STATERA Web Engine", lifespan=lifespan)
 
 
+class ManualEvalRequest(BaseModel):
+    video_name: str
+    pred_u: float
+    pred_v: float
+    center_u: float
+    center_v: float
+    true_u: float
+    true_v: float
+
+
+@app.post("/api/evaluate_manual")
+async def evaluate_manual(data: ManualEvalRequest):
+    # 1. Spatial Error
+    spatial_err = math.sqrt((data.pred_u - data.true_u) ** 2 + (data.pred_v - data.true_v) ** 2)
+
+    # 2. Define 2D Vectors (Origin is user-clicked Geometric Center)
+    v_true = np.array([data.true_u - data.center_u, data.true_v - data.center_v])
+    v_pred = np.array([data.pred_u - data.center_u, data.pred_v - data.center_v])
+
+    # 3. Magnitudes
+    mag_true = np.linalg.norm(v_true)
+    mag_pred = np.linalg.norm(v_pred)
+    mag_delta = mag_pred - mag_true
+
+    # 4. Phase Angle via Cosine Similarity
+    if mag_true > 1e-5 and mag_pred > 1e-5:
+        cos_theta = np.dot(v_true, v_pred) / (mag_true * mag_pred)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        angle_deg = math.degrees(math.acos(cos_theta))
+    else:
+        angle_deg = 0.0
+
+    # Print Formatted Report to Terminal
+    print(f"\n" + "=" * 60)
+    print(f" GOLD STANDARD MANUAL EVALUATION: {data.video_name}")
+    print(f"=" * 60)
+    print(f" --- TERMINAL PERFORMANCE (Frame 16) ---")
+    print(f" Terminal Spatial Error        : {spatial_err:.2f} Pixels")
+    print(f" Terminal Amplitude Error (Abs): {abs(mag_delta):.2f} Pixels")
+
+    print(f"\n" + "-" * 60)
+    print(f" 2D VECTOR ANALYSIS")
+    print(f"-" * 60)
+    print(f" 1. Magnitude True (Amplitude)    : {mag_true:.2f} px")
+    print(f" 2. Magnitude Pred (Amplitude)    : {mag_pred:.2f} px")
+    print(f" 3. Magnitude Delta (Pred - True) : {mag_delta:+.2f} px")
+    print(f" 4. Phase Angle Error (Pred VS True): {angle_deg:.1f}°")
+    print(f"=" * 60 + "\n")
+
+    return {"status": "success", "message": "Logged to terminal!"}
+
+
 @app.get("/api/auditor/infer/{ep_idx}")
 async def auditor_infer(ep_idx: int):
     if global_dataset is None or ep_idx < 0 or ep_idx >= len(global_dataset["videos"]):
@@ -118,7 +169,6 @@ async def auditor_infer(ep_idx: int):
     gt_uv_seq = global_dataset["uv_coords"][ep_idx].reshape(-1, 2)
     gt_z_seq = global_dataset["z_depths"][ep_idx].flatten()
 
-    # Ground truth values for telemetry panel (taking final frame)
     final_gt_uv = gt_uv_seq[-1]
     final_gt_z = float(gt_z_seq[-1])
 
@@ -126,20 +176,14 @@ async def auditor_infer(ep_idx: int):
     vid_tensor = vid_tensor.permute(1, 0, 2, 3).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred_h, pred_z = model(vid_tensor)  # [1, 16, 64, 64] and [1, 16, 1]
+        pred_h, pred_z = model(vid_tensor)
 
-        # Get sequence of coordinates [1, 16, 2] -> [16, 2]
         sub_uv_seq = get_subpixel_coords(pred_h)[0].cpu().numpy() * (384.0 / 64.0)
-
-        # Extract telemetry for UI (taking final frame)
         final_pred_u, final_pred_v = sub_uv_seq[-1]
         final_pred_z = pred_z[0, -1, 0].item()
-
-        # Raw heatmaps [16, 64, 64]
         raw_hm_seq = torch.sigmoid(pred_h)[0].cpu().numpy()
 
     out_frames = []
-    # Loop across the 16 frames to track the moving wobble
     for i in range(16):
         frame_rgb = np.transpose(vid_array[i], (1, 2, 0))
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -185,7 +229,6 @@ async def zero_shot_inference(
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     frames = []
-
     crop_size = max(384, int(crop_size))
     crop_x = int(crop_x)
     crop_y = int(crop_y)
@@ -195,7 +238,6 @@ async def zero_shot_inference(
         if not ret: break
 
         h, w = frame.shape[:2]
-
         x1 = max(0, crop_x)
         y1 = max(0, crop_y)
         x2 = x1 + crop_size
@@ -240,7 +282,6 @@ async def zero_shot_inference(
         raw_hm_seq = torch.sigmoid(pred_h)[0].cpu().numpy()
 
     out_frames = []
-    # Loop across the 16 frames tracking the moving wobble
     for i in range(16):
         pred_u, pred_v = sub_uv_seq[i]
         out = overlay_results(frames[i].copy(), pred_u, pred_v, raw_hm=raw_hm_seq[i])
@@ -252,13 +293,15 @@ async def zero_shot_inference(
         "pred_z": f"{final_pred_z:.4f} m",
         "gt_uv": "N/A",
         "pred_uv": f"{final_pred_u:.1f}, {final_pred_v:.1f}",
+        "raw_pred_u": float(final_pred_u),
+        "raw_pred_v": float(final_pred_v),
         "error_px": "N/A",
         "frames": frames_to_base64(out_frames)
     })
 
 
 # ==========================================
-# MATERIAL 3 FRONTEND (HTML is untouched)
+# MATERIAL 3 FRONTEND
 # ==========================================
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -298,20 +341,17 @@ HTML_CONTENT = """
     <style>
         body { background-color: #141218; color: #E6E0E9; }
 
-        /* Custom Material Sliders */
         input[type=range].m3-slider { -webkit-appearance: none; width: 100%; background: transparent; height: 40px; }
         input[type=range].m3-slider:focus { outline: none; }
         input[type=range].m3-slider::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #4A4458; border-radius: 4px; }
         input[type=range].m3-slider::-webkit-slider-thumb { height: 20px; width: 20px; border-radius: 50%; background: #D0BCFF; cursor: pointer; -webkit-appearance: none; margin-top: -6px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform 0.1s; }
         input[type=range].m3-slider::-webkit-slider-thumb:active { transform: scale(1.2); }
 
-        /* Timeline Custom Slider */
         .timeline-container { position: relative; height: 40px; display: flex; align-items: center; width: 100%; }
         .timeline-track { position: absolute; width: 100%; height: 12px; background: #49454F; border-radius: 6px; overflow: hidden; }
         .timeline-segment { position: absolute; height: 100%; background: rgba(208, 188, 255, 0.4); border-left: 2px solid #D0BCFF; border-right: 2px solid #D0BCFF; pointer-events: none; transition: left 0.1s linear; }
         input[type="range"].timeline-slider { position: absolute; width: 100%; height: 100%; opacity: 0; cursor: pointer; z-index: 10; margin: 0; }
 
-        /* Modal strict box & resizer */
         #strictCropBox { box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.7); border: 2px solid #D0BCFF; box-sizing: border-box; }
         #modalVideoWrapper { border-radius: 12px; overflow: hidden; position: relative; background: #000; display: inline-block; user-select: none; }
     </style>
@@ -355,7 +395,6 @@ HTML_CONTENT = """
 
                     <div class="flex items-center justify-between mb-8 p-4 bg-m3-surfaceHigh rounded-2xl">
                         <span class="text-sm font-medium text-m3-text">Auto-Cycle Episodes</span>
-                        <!-- M3 Switch -->
                         <label class="flex items-center cursor-pointer relative">
                             <input type="checkbox" id="autoCycleToggle" class="sr-only peer">
                             <div class="w-[52px] h-8 bg-m3-surfaceHigh border-2 border-m3-outline rounded-full peer peer-checked:bg-m3-primary peer-checked:border-m3-primary transition-all"></div>
@@ -381,7 +420,6 @@ HTML_CONTENT = """
                         <span class="text-m3-textVariant text-xs mt-1">Multi-file Batch supported</span>
                     </label>
 
-                    <!-- Batch Controls (Hidden unless multiple files uploaded) -->
                     <div id="zeroShotBatchControls" class="hidden">
                         <div class="mb-6">
                             <div class="flex justify-between items-center mb-2">
@@ -390,16 +428,14 @@ HTML_CONTENT = """
                             </div>
                             <input type="range" id="batchSlider" class="m3-slider" min="0" max="0" value="0">
                         </div>
-
-                        <div class="flex items-center justify-between p-4 bg-m3-surfaceHigh rounded-2xl">
-                            <span class="text-sm font-medium text-m3-text">Auto-Cycle Batch</span>
-                            <label class="flex items-center cursor-pointer relative">
-                                <input type="checkbox" id="autoCycleZeroShotToggle" class="sr-only peer" checked>
-                                <div class="w-[52px] h-8 bg-m3-surfaceHigh border-2 border-m3-outline rounded-full peer peer-checked:bg-m3-primary peer-checked:border-m3-primary transition-all"></div>
-                                <div class="absolute left-1.5 top-1.5 w-5 h-5 bg-m3-outline rounded-full peer-checked:bg-m3-onPrimary peer-checked:translate-x-[20px] transition-all flex items-center justify-center"></div>
-                            </label>
-                        </div>
                     </div>
+
+                    <!-- NEW: Manual Annotation Button -->
+                    <button id="btnAnnotateTruth" class="hidden w-full mt-4 py-3 rounded-full border border-m3-primary text-m3-primary font-medium text-sm flex items-center justify-center gap-2 hover:bg-m3-primary/10 transition shadow-md">
+                        <span class="material-symbols-rounded text-[20px]">target</span>
+                        Annotate Ground Truth
+                    </button>
+
                 </div>
             </div>
 
@@ -450,6 +486,12 @@ HTML_CONTENT = """
         <!-- RIGHT PANEL / OUTPUT STAGE -->
         <div class="bg-m3-surface rounded-[24px] p-6 flex-1 flex flex-col items-center justify-center min-h-[500px] relative border border-white/5 shadow-lg overflow-hidden">
 
+            <!-- ANNOTATION INSTRUCTION BANNER -->
+            <div id="annotationBanner" class="hidden absolute top-6 bg-black/80 backdrop-blur-md border border-m3-primary text-white px-6 py-3 rounded-full z-30 flex items-center justify-center gap-3 shadow-xl">
+                <span class="material-symbols-rounded text-m3-primary animate-pulse">touch_app</span>
+                <span id="annotationText" class="text-sm font-medium tracking-wide">Step 1: Click the Geometric Center of the Box</span>
+            </div>
+
             <div id="loader" class="hidden absolute inset-0 bg-m3-bg/80 backdrop-blur-sm z-20 flex flex-col items-center justify-center">
                 <div class="w-12 h-12 border-4 border-m3-surfaceHigh border-t-m3-primary rounded-full animate-spin mb-4"></div>
                 <p id="loaderText" class="text-m3-primary text-sm font-medium tracking-wide">Processing Tensors...</p>
@@ -477,7 +519,6 @@ HTML_CONTENT = """
     <!-- M3 Full-Screen Dialog for Video Preparation -->
     <div id="prepModal" class="fixed inset-0 z-50 hidden bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="bg-m3-surfaceHigh rounded-[28px] p-8 w-full max-w-3xl flex flex-col items-center shadow-2xl border border-white/5">
-
             <!-- Step 1: Sequence Selector -->
             <div id="modalStep1" class="w-full flex flex-col items-center animate-fade-in">
                 <div class="w-full flex justify-between items-center mb-6">
@@ -489,10 +530,7 @@ HTML_CONTENT = """
                         <span class="material-symbols-rounded">close</span>
                     </button>
                 </div>
-
                 <video id="modalVidPlayer" class="w-full rounded-2xl max-h-[45vh] bg-black mb-6 shadow-xl object-contain"></video>
-
-                <!-- Custom Segment Slider -->
                 <div class="w-full bg-m3-surface rounded-2xl p-4 mb-6 shadow-inner border border-white/5">
                     <div class="flex justify-between items-center mb-4">
                         <span id="timeLabel" class="text-sm font-medium text-m3-primary font-mono">Segment: 0.00s to 0.66s</span>
@@ -500,14 +538,12 @@ HTML_CONTENT = """
                             <span class="material-symbols-rounded text-[16px]">play_circle</span> Preview 16 Frames
                         </button>
                     </div>
-
                     <div class="timeline-container">
                         <div class="timeline-track"></div>
                         <div id="timelineSegment" class="timeline-segment"></div>
                         <input type="range" id="timelineSlider" class="timeline-slider" min="0" step="0.01" value="0">
                     </div>
                 </div>
-
                 <div class="flex justify-end w-full">
                     <button id="btnNextStep" class="px-8 py-2.5 rounded-full bg-m3-primary text-m3-onPrimary font-medium hover:bg-m3-primary/90 transition-shadow shadow-md">Next: Set Boundaries</button>
                 </div>
@@ -521,17 +557,13 @@ HTML_CONTENT = """
                         <p class="text-sm text-m3-textVariant mt-1">Scrub the 16 frames to ensure the object never leaves the box. <br>The box is restricted to a strict <b>minimum of 384x384</b>.</p>
                     </div>
                 </div>
-
                 <div id="modalVideoWrapper" class="shadow-2xl mb-6 relative">
                     <video id="modalVidFrame" class="block"></video>
-
                     <div id="strictCropBox" class="absolute cursor-move z-10 flex items-center justify-center">
                         <div id="cropResizeHandle" class="absolute bottom-[-2px] right-[-2px] w-5 h-5 bg-m3-primary cursor-se-resize rounded-tl-md shadow-md hover:scale-110 transition-transform"></div>
                         <span id="cropSizeLabel" class="text-white/80 bg-black/50 backdrop-blur-md px-3 py-1 rounded-full text-[11px] font-mono tracking-widest pointer-events-none">384x384</span>
                     </div>
                 </div>
-
-                <!-- 16-Frame Micro Scrubber -->
                 <div class="w-full bg-m3-surface rounded-2xl p-4 mb-6 shadow-inner border border-white/5">
                     <div class="flex justify-between items-center mb-2">
                         <span class="text-sm font-medium text-m3-textVariant">Scrub Segment Frames</span>
@@ -539,7 +571,6 @@ HTML_CONTENT = """
                     </div>
                     <input type="range" id="step2Scrubber" class="m3-slider" min="0" max="15" value="0">
                 </div>
-
                 <div class="flex justify-between w-full">
                     <button id="btnBackStep" class="px-6 py-2.5 rounded-full border border-m3-outlineVariant text-m3-primary font-medium hover:bg-m3-primary/10 transition-colors">Back</button>
                     <button id="btnRunZeroShot" class="px-8 py-2.5 rounded-full bg-m3-primary text-m3-onPrimary font-medium flex items-center gap-2 hover:bg-m3-primary/90 transition-shadow shadow-md">
@@ -547,30 +578,33 @@ HTML_CONTENT = """
                     </button>
                 </div>
             </div>
-
         </div>
     </div>
 
     <script>
-        // --- Tab Management ---
         let currentMode = 'auditor';
         const tabAuditor = document.getElementById('tabAuditor');
         const tabZeroShot = document.getElementById('tabZeroShot');
         const viewAuditor = document.getElementById('viewAuditor');
         const viewZeroShot = document.getElementById('viewZeroShot');
+        const btnAnnotateTruth = document.getElementById('btnAnnotateTruth');
 
         tabAuditor.onclick = () => { 
             currentMode='auditor'; 
             tabAuditor.className = "flex-1 py-2 text-sm font-medium rounded-full bg-m3-secondaryContainer text-m3-onSecondaryContainer transition-all z-10 shadow-sm";
             tabZeroShot.className = "flex-1 py-2 text-sm font-medium rounded-full text-m3-textVariant hover:text-m3-text transition-all z-10";
             viewAuditor.classList.remove('hidden'); viewZeroShot.classList.add('hidden'); resetOutput(); 
+            btnAnnotateTruth.classList.add('hidden');
         };
         tabZeroShot.onclick = () => { 
             currentMode='zeroshot'; 
             tabZeroShot.className = "flex-1 py-2 text-sm font-medium rounded-full bg-m3-secondaryContainer text-m3-onSecondaryContainer transition-all z-10 shadow-sm";
             tabAuditor.className = "flex-1 py-2 text-sm font-medium rounded-full text-m3-textVariant hover:text-m3-text transition-all z-10";
             viewZeroShot.classList.remove('hidden'); viewAuditor.classList.add('hidden'); resetOutput(); 
-            if (batchResults.length > 0) loadBatchResult(currentBatchIdx);
+            if (batchResults.length > 0) {
+                loadBatchResult(currentBatchIdx);
+                btnAnnotateTruth.classList.remove('hidden');
+            }
         };
 
         // --- Playback Engine ---
@@ -592,6 +626,7 @@ HTML_CONTENT = """
             document.getElementById('statsPanel').classList.add('hidden');
             document.getElementById('statsPanel').classList.remove('flex');
             document.getElementById('emptyState').classList.remove('hidden');
+            cancelAnnotation(); // Reset state
         }
 
         function renderFrame(idx) {
@@ -604,6 +639,7 @@ HTML_CONTENT = """
 
         function startSequence() {
             if(!currentFrames.length) return;
+            cancelAnnotation(); // Stop annotating if they play video
             isPlaying = true;
             document.getElementById('iconPlay').classList.add('hidden'); 
             document.getElementById('iconPause').classList.remove('hidden');
@@ -620,13 +656,6 @@ HTML_CONTENT = """
                             document.getElementById('epSlider').value = nextEp;
                             document.getElementById('epLabel').innerText = nextEp;
                             document.getElementById('btnInferAuditor').click();
-                        }, 500);
-                    } else if (currentMode === 'zeroshot' && batchResults.length > 1 && document.getElementById('autoCycleZeroShotToggle').checked) {
-                        setTimeout(() => {
-                            let nextIdx = currentBatchIdx + 1;
-                            if (nextIdx >= batchResults.length) nextIdx = 0;
-                            document.getElementById('batchSlider').value = nextIdx;
-                            loadBatchResult(nextIdx);
                         }, 500);
                     }
                 } else {
@@ -732,31 +761,22 @@ HTML_CONTENT = """
             modalVidPlayer.currentTime = val;
         }
 
-        timelineSlider.addEventListener('input', () => {
-            updateTimeline();
-            modalVidPlayer.pause();
-        });
+        timelineSlider.addEventListener('input', () => { updateTimeline(); modalVidPlayer.pause(); });
 
-        // Step 1: "Preview Segment" logic
         let previewInterval;
         document.getElementById('btnPreviewSegment').onclick = () => {
             clearInterval(previewInterval);
             const startVal = parseFloat(timelineSlider.value);
             const endVal = startVal + segmentDuration;
-
             modalVidPlayer.currentTime = startVal;
             modalVidPlayer.play();
-
             previewInterval = setInterval(() => {
                 if(modalVidPlayer.currentTime >= endVal || modalVidPlayer.paused) {
-                    modalVidPlayer.pause();
-                    modalVidPlayer.currentTime = startVal;
-                    clearInterval(previewInterval);
+                    modalVidPlayer.pause(); modalVidPlayer.currentTime = startVal; clearInterval(previewInterval);
                 }
             }, 30);
         };
 
-        // File Uploader Event Trigger
         document.getElementById('videoUpload').onchange = (e) => {
             if(e.target.files.length > 0) {
                 batchFiles = Array.from(e.target.files);
@@ -768,7 +788,6 @@ HTML_CONTENT = """
         function startConfigFlow(idx) {
             currentConfigIdx = idx;
             const file = batchFiles[idx];
-
             modalVidPlayer.src = URL.createObjectURL(file);
 
             const step1Title = document.getElementById('step1Title');
@@ -779,7 +798,6 @@ HTML_CONTENT = """
                 step1Title.innerText = `Step 1: Isolate Sequence (${idx + 1}/${batchFiles.length})`;
                 step2Title.innerText = `Step 2: Track & Crop Box (${idx + 1}/${batchFiles.length})`;
                 document.getElementById('step1Subtitle').innerText = `Select timespan for: ${file.name}`;
-
                 if (idx < batchFiles.length - 1) {
                     btnRunZeroShot.innerHTML = `Configure Next Video <span class="material-symbols-rounded text-[20px]">arrow_forward</span>`;
                 } else {
@@ -802,83 +820,53 @@ HTML_CONTENT = """
             prepModal.classList.add('hidden'); modalVidPlayer.pause(); clearInterval(previewInterval);
         };
 
-        // Proceed to Step 2
         document.getElementById('btnNextStep').onclick = () => {
             modalVidPlayer.pause(); clearInterval(previewInterval);
-
-            step2Scrubber.value = 0;
-            step2FrameLabel.innerText = 'Frame 1/16';
-            modalVidFrame.src = modalVidPlayer.src;
-            modalVidFrame.currentTime = timelineSlider.value;
-
-            modalStep1.classList.add('hidden');
-            modalStep2.classList.remove('hidden');
+            step2Scrubber.value = 0; step2FrameLabel.innerText = 'Frame 1/16';
+            modalVidFrame.src = modalVidPlayer.src; modalVidFrame.currentTime = timelineSlider.value;
+            modalStep1.classList.add('hidden'); modalStep2.classList.remove('hidden');
 
             setTimeout(() => {
-                const vw = modalVidFrame.videoWidth;
-                const vh = modalVidFrame.videoHeight;
-
+                const vw = modalVidFrame.videoWidth; const vh = modalVidFrame.videoHeight;
                 const maxDisplayHeight = window.innerHeight * 0.45;
                 displayScale = Math.min(1.0, maxDisplayHeight / vh);
+                const dispW = vw * displayScale; const dispH = vh * displayScale;
 
-                const dispW = vw * displayScale;
-                const dispH = vh * displayScale;
+                videoWrapper.style.width = dispW + 'px'; videoWrapper.style.height = dispH + 'px';
+                modalVidFrame.style.width = dispW + 'px'; modalVidFrame.style.height = dispH + 'px';
 
-                videoWrapper.style.width = dispW + 'px';
-                videoWrapper.style.height = dispH + 'px';
-                modalVidFrame.style.width = dispW + 'px';
-                modalVidFrame.style.height = dispH + 'px';
-
-                // Ensure the box is initialized to exactly 384x384 Native pixels.
                 let initialBoxDispSize = 384 * displayScale;
-
-                strictCropBox.style.width = initialBoxDispSize + 'px';
-                strictCropBox.style.height = initialBoxDispSize + 'px';
+                strictCropBox.style.width = initialBoxDispSize + 'px'; strictCropBox.style.height = initialBoxDispSize + 'px';
                 strictCropBox.style.display = 'block';
 
-                // Initial Safe Center Pos
                 const leftPos = Math.max(0, (dispW / 2) - (initialBoxDispSize / 2));
                 const topPos = Math.max(0, (dispH / 2) - (initialBoxDispSize / 2));
-
-                strictCropBox.style.left = leftPos + 'px';
-                strictCropBox.style.top = topPos + 'px';
-
+                strictCropBox.style.left = leftPos + 'px'; strictCropBox.style.top = topPos + 'px';
                 cropSizeLabel.innerText = Math.round(initialBoxDispSize / displayScale) + 'x' + Math.round(initialBoxDispSize / displayScale);
             }, 250);
         };
 
-        document.getElementById('btnBackStep').onclick = () => {
-            modalStep2.classList.add('hidden');
-            modalStep1.classList.remove('hidden');
-        };
+        document.getElementById('btnBackStep').onclick = () => { modalStep2.classList.add('hidden'); modalStep1.classList.remove('hidden'); };
 
-        // Step 2: 16-Frame Interactive Scrubber
         step2Scrubber.addEventListener('input', (e) => {
             const frameOffset = parseInt(e.target.value);
-            const startTime = parseFloat(timelineSlider.value);
-            modalVidFrame.currentTime = startTime + (frameOffset / fpsEstimate);
+            modalVidFrame.currentTime = parseFloat(timelineSlider.value) + (frameOffset / fpsEstimate);
             step2FrameLabel.innerText = `Frame ${frameOffset + 1}/16`;
         });
 
-        // Step 2: Box Drag & Resizing Logic
         let isDragging = false, isResizing = false;
         let startX, startY, startLeft, startTop, startWidth;
 
         strictCropBox.onmousedown = (e) => {
             if (e.target === cropResizeHandle) return; 
-            isDragging = true;
-            startX = e.clientX; startY = e.clientY;
-            startLeft = parseFloat(strictCropBox.style.left) || 0;
-            startTop = parseFloat(strictCropBox.style.top) || 0;
+            isDragging = true; startX = e.clientX; startY = e.clientY;
+            startLeft = parseFloat(strictCropBox.style.left) || 0; startTop = parseFloat(strictCropBox.style.top) || 0;
             e.preventDefault();
         };
 
         cropResizeHandle.onmousedown = (e) => {
-            isResizing = true;
-            startX = e.clientX;
-            startWidth = strictCropBox.offsetWidth;
-            e.stopPropagation(); 
-            e.preventDefault();
+            isResizing = true; startX = e.clientX; startWidth = strictCropBox.offsetWidth;
+            e.stopPropagation(); e.preventDefault();
         };
 
         window.onmousemove = (e) => {
@@ -887,9 +875,7 @@ HTML_CONTENT = """
                 strictCropBox.style.left = Math.max(0, Math.min(videoWrapper.offsetWidth - strictCropBox.offsetWidth, startLeft + dx)) + 'px';
                 strictCropBox.style.top = Math.max(0, Math.min(videoWrapper.offsetHeight - strictCropBox.offsetHeight, startTop + dy)) + 'px';
             } else if (isResizing) {
-                const dx = e.clientX - startX;
-                let newSize = startWidth + dx;
-
+                const dx = e.clientX - startX; let newSize = startWidth + dx;
                 const minAllowed = 384 * displayScale;
                 const currentLeft = parseFloat(strictCropBox.style.left) || 0;
                 const currentTop = parseFloat(strictCropBox.style.top) || 0;
@@ -898,124 +884,161 @@ HTML_CONTENT = """
                 const absoluteMax = Math.max(minAllowed, Math.min(maxAllowedW, maxAllowedH));
 
                 newSize = Math.max(minAllowed, Math.min(newSize, absoluteMax));
-
-                strictCropBox.style.width = newSize + 'px';
-                strictCropBox.style.height = newSize + 'px';
-
+                strictCropBox.style.width = newSize + 'px'; strictCropBox.style.height = newSize + 'px';
                 const nativeSize = Math.round(newSize / displayScale);
                 cropSizeLabel.innerText = nativeSize + 'x' + nativeSize;
             }
         };
 
-        window.onmouseup = () => {
-            isDragging = false;
-            isResizing = false;
-        };
+        window.onmouseup = () => { isDragging = false; isResizing = false; };
 
         function loadBatchResult(idx) {
             currentBatchIdx = parseInt(idx);
             const data = batchResults[currentBatchIdx];
 
             document.getElementById('stat_ep').innerText = data.ep_idx;
-            document.getElementById('stat_gt_z').innerText = data.gt_z;
+            document.getElementById('stat_gt_z').innerText = data.pred_z;
             document.getElementById('stat_pred_z').innerText = data.pred_z;
-            document.getElementById('stat_gt_uv').innerText = data.gt_uv;
+            document.getElementById('stat_gt_uv').innerText = "N/A";
             document.getElementById('stat_pred_uv').innerText = data.pred_uv;
-            document.getElementById('stat_err').innerText = data.error_px;
+            document.getElementById('stat_err').innerText = "N/A";
 
             if (batchResults.length > 1) {
                 document.getElementById('batchLabel').innerText = `${currentBatchIdx + 1} / ${batchResults.length}`;
             }
 
             initSequence(data.frames);
+            btnAnnotateTruth.classList.remove('hidden');
         }
 
         document.getElementById('batchSlider').addEventListener('input', (e) => {
-            stopSequence();
-            loadBatchResult(e.target.value);
+            stopSequence(); loadBatchResult(e.target.value);
         });
 
-        // "Extract / Next Video" Button
         document.getElementById('btnRunZeroShot').onclick = () => {
             const nativeX = Math.round((parseFloat(strictCropBox.style.left) || 0) / displayScale);
             const nativeY = Math.round((parseFloat(strictCropBox.style.top) || 0) / displayScale);
             const nativeSize = Math.round(strictCropBox.offsetWidth / displayScale);
             const startTime = timelineSlider.value;
 
-            // Save config for this individual video
             batchConfigs.push({
-                file: batchFiles[currentConfigIdx],
-                startTime: startTime,
-                cropX: nativeX,
-                cropY: nativeY,
-                cropSize: nativeSize
+                file: batchFiles[currentConfigIdx], startTime: startTime, cropX: nativeX, cropY: nativeY, cropSize: nativeSize
             });
 
             if (currentConfigIdx < batchFiles.length - 1) {
                 startConfigFlow(currentConfigIdx + 1);
             } else {
-                prepModal.classList.add('hidden');
-                runBatchInference();
+                prepModal.classList.add('hidden'); runBatchInference();
             }
         };
 
-        // Processes all saved configs
         async function runBatchInference() {
             resetOutput();
             document.getElementById('emptyState').classList.add('hidden');
             document.getElementById('loader').classList.remove('hidden');
             document.getElementById('loader').classList.add('flex');
 
-            batchResults =[];
-            currentBatchIdx = 0;
+            batchResults =[]; currentBatchIdx = 0;
 
             for(let i = 0; i < batchConfigs.length; i++) {
                 const config = batchConfigs[i];
-
-                if (batchConfigs.length > 1) {
-                    document.getElementById('loaderText').innerText = `Processing Video ${i + 1} of ${batchConfigs.length}...`;
-                } else {
-                    document.getElementById('loaderText').innerText = `Processing Tensors...`;
-                }
+                if (batchConfigs.length > 1) document.getElementById('loaderText').innerText = `Processing Video ${i + 1} of ${batchConfigs.length}...`;
 
                 const fd = new FormData();
                 fd.append('video', config.file);
                 fd.append('start_time', config.startTime);
-                fd.append('crop_x', config.cropX); 
-                fd.append('crop_y', config.cropY);
-                fd.append('crop_size', config.cropSize);
+                fd.append('crop_x', config.cropX); fd.append('crop_y', config.cropY); fd.append('crop_size', config.cropSize);
 
                 try {
                     const res = await fetch('/api/zero_shot', { method: 'POST', body: fd });
                     const data = await res.json();
-
                     data.ep_idx = config.file.name;
                     batchResults.push(data);
-                } catch (e) {
-                    console.error(`Inference failed on file: ${config.file.name}`);
-                }
+                } catch (e) { console.error(`Inference failed on file`); }
             }
 
             document.getElementById('loader').classList.add('hidden');
             document.getElementById('loader').classList.remove('flex');
-            document.getElementById('loaderText').innerText = `Processing Tensors...`;
 
             if (batchResults.length > 0) {
                 if (batchResults.length > 1) {
                     document.getElementById('zeroShotBatchControls').classList.remove('hidden');
                     const batchSlider = document.getElementById('batchSlider');
-                    batchSlider.max = batchResults.length - 1;
-                    batchSlider.value = 0;
-                } else {
-                    document.getElementById('zeroShotBatchControls').classList.add('hidden');
+                    batchSlider.max = batchResults.length - 1; batchSlider.value = 0;
                 }
-
                 loadBatchResult(0);
             } else {
-                alert("Zero-Shot Inference failed for all uploaded files.");
                 document.getElementById('emptyState').classList.remove('hidden');
             }
         }
+
+        // ==========================================
+        // MANUAL ANNOTATION LOGIC
+        // ==========================================
+        let annotationStep = 0;
+        let manualCenter = null;
+        let manualTrue = null;
+        const annotationBanner = document.getElementById('annotationBanner');
+        const annotationText = document.getElementById('annotationText');
+
+        function cancelAnnotation() {
+            annotationStep = 0;
+            annotationBanner.classList.add('hidden');
+            resultCanvas.style.cursor = 'default';
+        }
+
+        btnAnnotateTruth.onclick = () => {
+            stopSequence();
+            renderFrame(15); // Jump to final frame
+            annotationStep = 1;
+            annotationText.innerText = "Step 1: Click the Geometric Center of the box";
+            annotationBanner.classList.remove('hidden');
+            resultCanvas.style.cursor = 'crosshair';
+        };
+
+        resultCanvas.onclick = async (e) => {
+            if (annotationStep === 0) return;
+
+            const rect = resultCanvas.getBoundingClientRect();
+            // Scale click coordinates from the DOM size to the actual 384x384 tensor size
+            const scaleX = 384.0 / rect.width;
+            const scaleY = 384.0 / rect.height;
+
+            const clickX = (e.clientX - rect.left) * scaleX;
+            const clickY = (e.clientY - rect.top) * scaleY;
+
+            if (annotationStep === 1) {
+                manualCenter = { x: clickX, y: clickY };
+                annotationStep = 2;
+                annotationText.innerText = "Step 2: Click the true Center of Mass (Weight)";
+            } else if (annotationStep === 2) {
+                manualTrue = { x: clickX, y: clickY };
+                cancelAnnotation();
+
+                const currentData = batchResults[currentBatchIdx];
+                const payload = {
+                    video_name: currentData.ep_idx,
+                    pred_u: currentData.raw_pred_u,
+                    pred_v: currentData.raw_pred_v,
+                    center_u: manualCenter.x,
+                    center_v: manualCenter.y,
+                    true_u: manualTrue.x,
+                    true_v: manualTrue.y
+                };
+
+                try {
+                    const res = await fetch('/api/evaluate_manual', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    const resData = await res.json();
+                    alert("✅ Benchmark complete! Check your Python terminal for the final physics report.");
+                } catch (err) {
+                    alert("Failed to submit annotation.");
+                }
+            }
+        };
     </script>
 </body>
 </html>

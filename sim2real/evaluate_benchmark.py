@@ -166,118 +166,115 @@ def evaluate_statera():
             x1, y1 = cx - (target_size // 2), cy - (target_size // 2)
             scale = 384.0 / target_size
 
-            # Inference unpacks 3 variables
-            pred_h, pred_z, pred_m = model(vid_tensor)
+            # Inference unpacks ONLY 2 variables now!
+            pred_h, pred_z = model(vid_tensor)
             sub_uv_seq = get_subpixel_coords(pred_h, device)[0].cpu().numpy() * 6.0
 
             seq_spatial_err = 0.0
             seq_depth_err = 0.0
-            seq_mag_err = 0.0
+            seq_mag_err_px = 0.0
 
             for frame_idx in range(16):
                 f_data = target_data["frames"][frame_idx]
 
                 target_z = abs(float(f_data["z_depth_meters"]))
-                target_m = abs(float(f_data.get("com_magnitude_meters", 0.0)))
                 target_u = f_data["com_u"]
                 target_v = f_data["com_v"]
 
                 pred_u, pred_v = sub_uv_seq[frame_idx]
                 pred_z_val = abs(float(pred_z[0, frame_idx, 0].item()))
 
-                # Extract model's predicted scalar magnitude
-                pred_m_val = abs(float(pred_m[0, frame_idx, 0].item()))
+                # CORRECT Center Calculation (Project the exact 3D origin)
+                center_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+                center_2d_f, _ = cv2.projectPoints(center_3d, np.array(f_data["rvec"]), np.array(f_data["tvec"]), mtx,
+                                                   dist)
 
-                # Center Calculation
-                box_2d_f, _ = cv2.projectPoints(box_3d, np.array(f_data["rvec"]), np.array(f_data["tvec"]), mtx, dist)
-                centroid_u = ((np.min(box_2d_f[:, 0, 0]) + np.max(box_2d_f[:, 0, 0])) / 2.0 - x1) * scale
-                centroid_v = ((np.min(box_2d_f[:, 0, 1]) + np.max(box_2d_f[:, 0, 1])) / 2.0 - y1) * scale
+                centroid_u = (center_2d_f[0][0][0] - x1) * scale
+                centroid_v = (center_2d_f[0][0][1] - y1) * scale
 
                 # General Metrics
                 l2_dist = math.sqrt((pred_u - target_u) ** 2 + (pred_v - target_v) ** 2)
                 abs_z_err = abs(pred_z_val - target_z)
-                abs_m_err = abs(pred_m_val - target_m)
+
+                # NATIVE MAGNITUDE CALCULATION (In Pixels)
+                v_true_f = np.array([target_u - centroid_u, target_v - centroid_v])
+                v_pred_f = np.array([pred_u - centroid_u, pred_v - centroid_v])
+                mag_true_px = np.linalg.norm(v_true_f)
+                mag_pred_px = np.linalg.norm(v_pred_f)
+                abs_m_err_px = abs(mag_pred_px - mag_true_px)
 
                 dist_true_to_centroid = math.sqrt((target_u - centroid_u) ** 2 + (target_v - centroid_v) ** 2)
                 dist_pred_to_centroid = math.sqrt((pred_u - centroid_u) ** 2 + (pred_v - centroid_v) ** 2)
 
                 traj_spatial_errors.append(l2_dist)
                 traj_depth_errors.append(abs_z_err)
-                traj_mag_errors.append(abs_m_err)
+                traj_mag_errors.append(abs_m_err_px)  # Appending Pixels now
                 dist_true_to_centroid_list.append(dist_true_to_centroid)
                 dist_pred_to_centroid_list.append(dist_pred_to_centroid)
 
                 seq_spatial_err += l2_dist
                 seq_depth_err += abs_z_err
-                seq_mag_err += abs_m_err
+                seq_mag_err_px += abs_m_err_px
 
                 # --- 16TH FRAME VECTOR CALCULATIONS ---
                 if frame_idx == 15:
                     term_spatial_errors.append(l2_dist)
                     term_depth_errors.append(abs_z_err)
-                    term_mag_errors.append(abs_m_err)
-
-                    # 1. Define 2D Vectors
-                    v_true = np.array([target_u - centroid_u, target_v - centroid_v])
-                    v_pred = np.array([pred_u - centroid_u, pred_v - centroid_v])
-
-                    # 2. 2D Magnitudes
-                    mag_true = np.linalg.norm(v_true)
-                    mag_pred = np.linalg.norm(v_pred)
+                    term_mag_errors.append(abs_m_err_px)
 
                     # 3. Angle (Phase Error) via Cosine Similarity
-                    if mag_true > 1e-5 and mag_pred > 1e-5:
-                        cos_theta = np.dot(v_true, v_pred) / (mag_true * mag_pred)
+                    if mag_true_px > 1e-5 and mag_pred_px > 1e-5:
+                        cos_theta = np.dot(v_true_f, v_pred_f) / (mag_true_px * mag_pred_px)
                         cos_theta = np.clip(cos_theta, -1.0, 1.0)  # Prevent float rounding NaNs
                         angle_deg = math.degrees(math.acos(cos_theta))
                     else:
                         angle_deg = 0.0
 
-                    term_mags_true.append(mag_true)
-                    term_mags_pred.append(mag_pred)
-                    term_mag_deltas.append(mag_pred - mag_true)
+                    term_mags_true.append(mag_true_px)
+                    term_mags_pred.append(mag_pred_px)
+                    term_mag_deltas.append(mag_pred_px - mag_true_px)
                     term_angles.append(angle_deg)
 
             avg_seq_spatial = seq_spatial_err / 16.0
-            avg_seq_mag_cm = (seq_mag_err / 16.0) * 100.0  # Print in CM
+            avg_seq_mag_px = seq_mag_err_px / 16.0  # Print in PX
             valid_count += 1
 
             # Print single-sequence preview
             print(
-                f"   -> [Seq {valid_count:03d}] UV-Err: {avg_seq_spatial:5.2f}px | Mag Err: {avg_seq_mag_cm:5.1f}cm | Angle Err: {term_angles[-1]:5.1f}°")
+                f"   -> [Seq {valid_count:03d}] UV-Err: {avg_seq_spatial:5.2f}px | Mag Err: {avg_seq_mag_px:5.1f}px | Angle Err: {term_angles[-1]:5.1f}°")
 
-    # --- AGGREGATION & PROOF ---
-    if valid_count == 0: return
+            # --- AGGREGATION & PROOF ---
+        if valid_count == 0: return
 
-    # Sequence Averages
-    mean_traj_spatial = np.mean(traj_spatial_errors)
-    mean_traj_depth = np.mean(traj_depth_errors)
-    mean_traj_mag = np.mean(traj_mag_errors) * 100.0  # Convert to CM
+        # Sequence Averages
+        mean_traj_spatial = np.mean(traj_spatial_errors)
+        mean_traj_depth = np.mean(traj_depth_errors)
+        mean_traj_mag = np.mean(traj_mag_errors)  # Already in PX
 
-    # Terminal (Frame 16) Averages
-    mean_term_spatial = np.mean(term_spatial_errors)
-    max_term_spatial = np.max(term_spatial_errors)
-    mean_term_depth = np.mean(term_depth_errors)
-    mean_term_mag = np.mean(term_mag_errors) * 100.0  # Convert to CM
+        # Terminal (Frame 16) Averages
+        mean_term_spatial = np.mean(term_spatial_errors)
+        max_term_spatial = np.max(term_spatial_errors)
+        mean_term_depth = np.mean(term_depth_errors)
+        mean_term_mag = np.mean(term_mag_errors)  # Already in PX
 
-    # Vector Math Averages
-    mean_mag_true = np.mean(term_mags_true)
-    mean_mag_pred = np.mean(term_mags_pred)
-    mean_mag_delta = np.mean(term_mag_deltas)
-    mean_angle = np.mean(term_angles)
+        # Vector Math Averages
+        mean_mag_true = np.mean(term_mags_true)
+        mean_mag_pred = np.mean(term_mags_pred)
+        mean_mag_delta = np.mean(term_mag_deltas)
+        mean_angle = np.mean(term_angles)
 
-    print("\n" + "=" * 60)
-    print(" TEMPORAL BENCHMARK RESULTS")
-    print("=" * 60)
-    print(f" Total Sequences Validated : {valid_count}")
-    print("\n --- TRAJECTORY PERFORMANCE (All 16 Frames) ---")
-    print(f" Mean Trajectory Spatial Error : {mean_traj_spatial:.2f} Pixels")
-    print(f" Mean Trajectory Depth Error   : {mean_traj_depth:.4f} Meters")
-    print(f" Mean Trajectory 3D Mag Error  : {mean_traj_mag:.2f} Centimeters")
-    print("\n --- TERMINAL PERFORMANCE (Final Frame 16) ---")
-    print(f" Mean Terminal Spatial Error   : {mean_term_spatial:.2f} Pixels")
-    print(f" Max Terminal Spatial Error    : {max_term_spatial:.2f} Pixels")
-    print(f" Mean Terminal 3D Mag Error    : {mean_term_mag:.2f} Centimeters")
+        print("\n" + "=" * 60)
+        print(" TEMPORAL BENCHMARK RESULTS")
+        print("=" * 60)
+        print(f" Total Sequences Validated : {valid_count}")
+        print("\n --- TRAJECTORY PERFORMANCE (All 16 Frames) ---")
+        print(f" Mean Trajectory Spatial Error : {mean_traj_spatial:.2f} Pixels")
+        print(f" Mean Trajectory Depth Error   : {mean_traj_depth:.4f} Meters")
+        print(f" Mean Trajectory Amplitude Err : {mean_traj_mag:.2f} Pixels")
+        print("\n --- TERMINAL PERFORMANCE (Final Frame 16) ---")
+        print(f" Mean Terminal Spatial Error   : {mean_term_spatial:.2f} Pixels")
+        print(f" Max Terminal Spatial Error    : {max_term_spatial:.2f} Pixels")
+        print(f" Mean Terminal Amplitude Err   : {mean_term_mag:.2f} Pixels")
 
     print("\n" + "-" * 60)
     print(" 2D VECTOR ANALYSIS (Terminal Frame)")

@@ -2,7 +2,6 @@ import numpy as np
 import random
 import colorsys
 
-
 def get_contrasting_colors():
     hue_sky = random.random()
     hue_floor = (hue_sky + random.uniform(0.33, 0.66)) % 1.0
@@ -46,31 +45,39 @@ def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8):
 
 
 def generate_noise_based_com(shape_type, size_x, size_y, size_z):
-    while True:
-        noise_x = np.random.uniform(-1.0, 1.0)
-        noise_y = np.random.uniform(-1.0, 1.0)
-        noise_z = np.random.uniform(-1.0, 1.0)
+    # The Mass Distribution Fix: Uniformly spawn anywhere from 10% to 90% of the distance to the edge
+    # This samples uniformly across the radius (distance), removing extreme edge volumetric bias.
+    extremity = np.random.uniform(0.1, 0.9)
 
-        is_valid = False
-        extremity = 0.0
+    if shape_type in ["box", "beveled_box"]:
+        point = np.random.uniform(-extremity, extremity, 3)
+        face = random.randint(0, 2)
+        point[face] = extremity * random.choice([-1, 1])
+        noise_x, noise_y, noise_z = point
 
-        if shape_type in ["box", "beveled_box"]:
-            is_valid = True
-            extremity = max(abs(noise_x), abs(noise_y), abs(noise_z))
+    elif shape_type == "cylinder":
+        if random.random() < 0.5:
+            theta = np.random.uniform(0, 2 * np.pi)
+            r = extremity * np.sqrt(random.random())
+            noise_x = r * np.cos(theta)
+            noise_y = r * np.sin(theta)
+            noise_z = extremity * random.choice([-1, 1])
+        else:
+            theta = np.random.uniform(0, 2 * np.pi)
+            noise_x = extremity * np.cos(theta)
+            noise_y = extremity * np.sin(theta)
+            noise_z = np.random.uniform(-extremity, extremity)
 
-        elif shape_type == "cylinder":
-            radius_xy = np.sqrt(noise_x ** 2 + noise_y ** 2)
-            is_valid = radius_xy <= 1.0
-            extremity = max(radius_xy, abs(noise_z))
+    elif shape_type == "ellipsoid":
+        u = np.random.uniform(0, 1)
+        v = np.random.uniform(0, 1)
+        theta = 2 * np.pi * u
+        phi = np.arccos(2 * v - 1)
+        noise_x = extremity * np.sin(phi) * np.cos(theta)
+        noise_y = extremity * np.sin(phi) * np.sin(theta)
+        noise_z = extremity * np.cos(phi)
 
-        elif shape_type == "ellipsoid":
-            radius_xyz = np.sqrt(noise_x ** 2 + noise_y ** 2 + noise_z ** 2)
-            is_valid = radius_xyz <= 1.0
-            extremity = radius_xyz
-
-        # Change 2A: Allowed CoM offset expanded to 90% extreme distance to the edge
-        if is_valid and 0.1 <= extremity <= 0.9:
-            return noise_x * size_x, noise_y * size_y, noise_z * size_z
+    return noise_x * size_x, noise_y * size_y, noise_z * size_z
 
 
 def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z):
@@ -97,20 +104,17 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     is_close_target = random.random() < 0.15 and cam_mode != "STATIC"
 
-    # Change 1: Locked Camera FOV randomization strictly between [65, 85] degrees everywhere
+    # The Optics: Locked Camera FOV randomization strictly between [65, 85] degrees perfectly mimicking phone lenses
     camera_fovy = np.random.uniform(65, 85)
 
+    # The Scale Fix (Camera Distance): Randomize the physical distance of the camera from the object (0.5m to 4.0m)
+    radius = np.random.uniform(0.5, 4.0)
+
     if cam_mode == "STATIC":
-        radius = np.random.uniform(3.5, 6.0)
         drop_height = np.random.uniform(2.0, 5.0)
     elif is_close_target:
-        radius = np.random.uniform(1.1, 1.7)
         drop_height = np.random.uniform(1.0, 2.5)
     else:
-        if cam_mode == "STABLE":
-            radius = np.random.uniform(1.8, 2.4)
-        else:  # CHAOTIC
-            radius = np.random.uniform(1.3, 1.8)
         drop_height = np.random.uniform(2.5, 4.5)
 
     azimuth = np.random.uniform(0, 2 * np.pi)
@@ -122,9 +126,14 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     floor_texture = random.choices(["checker", "gradient", "flat"], weights=[0.2, 0.4, 0.4])[0]
 
-    # Change 3: Removed small micro-textures. Keep macro textures using random asymmetric repeats
-    object_texture = random.choices(["checker", "gradient"], weights=[0.6, 0.4])[0]
-    texrepeat_str = f"{random.choice([1, 2])} {random.choice([1, 2])}"
+    # The Textures: Heavy bias towards high-contrast macro-textures (like ArUco checkerboards) to prevent visual aliasing
+    object_texture = random.choices(["checker", "gradient"], weights=[0.8, 0.2])[0]
+    texrepeat_str = f"{random.choice([2, 3, 4])} {random.choice([2, 3, 4])}"
+
+    # Generate a stark contrasting secondary color based on luminance
+    rgb1_parts = list(map(float, color_obj_rgb.split()))
+    luminance = 0.299 * rgb1_parts[0] + 0.587 * rgb1_parts[1] + 0.114 * rgb1_parts[2]
+    rgb2_obj = "0.05 0.05 0.05" if luminance > 0.5 else "0.95 0.95 0.95"
 
     def random_gray():
         val = np.random.uniform(0.2, 0.8)
@@ -193,7 +202,6 @@ def generate_randomized_xml(cam_mode="STABLE"):
     mass = np.random.uniform(1.5, 4.0)
     inertia_string = calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z)
 
-    # Change 6: Calculate CoM Offset Magnitude Scalar to return
     com_magnitude = np.sqrt(com_x ** 2 + com_y ** 2 + com_z ** 2)
 
     xml_string = f"""
@@ -212,7 +220,7 @@ def generate_randomized_xml(cam_mode="STABLE"):
             <texture name="tex_floor" type="2d" builtin="{floor_texture}" rgb1="{color_floor_rgb}" rgb2="{random_gray()}" width="512" height="512"/>
             <texture name="tex_ramp" type="2d" builtin="flat" rgb1="{color_floor_rgb}" rgb2="{random_gray()}" width="512" height="512"/>
 
-            <texture name="tex_obj" type="2d" builtin="{object_texture}" rgb1="{color_obj_rgb}" rgb2="{random_gray()}" width="512" height="512"/>
+            <texture name="tex_obj" type="2d" builtin="{object_texture}" rgb1="{color_obj_rgb}" rgb2="{rgb2_obj}" width="512" height="512"/>
 
             <material name="mat_floor" texture="tex_floor" texrepeat="5 5" specular="0.2" shininess="0.1"/>
             <material name="mat_ramp" texture="tex_ramp" specular="0.1" shininess="0.1"/>
