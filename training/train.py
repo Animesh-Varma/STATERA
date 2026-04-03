@@ -1,261 +1,175 @@
 import os
+import sys
 import time
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
 import wandb
+import argparse
+import traceback
 
 from dataset import StateraDataset
 from model import StateraModel
 
-LOG_FILE = "statera_training.log"
 
-
-def log_print(msg):
-    print(msg)
-    with open(LOG_FILE, "a") as f:
-        f.write(msg + "\n")
+def parse_args():
+    parser = argparse.ArgumentParser(description="STATERA Ablation Training Pipeline")
+    parser.add_argument('--decoder_type', type=str, default='mlp', choices=['mlp', 'deconv'])
+    parser.add_argument('--temporal_mixer', type=str, default='conv1d', choices=['conv1d', 'transformer'])
+    parser.add_argument('--target_type', type=str, default='dot', choices=['dot', 'blend', 'crescent'])
+    parser.add_argument('--backbone', type=str, default='vjepa', choices=['vjepa', 'dinov2'])
+    parser.add_argument('--temporal_weighting', type=str, default='exponential', choices=['exponential', 'uniform'])
+    parser.add_argument('--single_task', action='store_true', help="Disable Z-Depth tracking")
+    parser.add_argument('--static_sigma', action='store_true', help="Keep Sigma 3.0 instead of annealing")
+    parser.add_argument('--scratch', action='store_true', help="Train backbone without pre-trained weights")
+    parser.add_argument('--wandb_name', type=str, required=True)
+    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'])
+    return parser.parse_args()
 
 
 def get_subpixel_coords(logits_heatmap):
     B, T, H, W = logits_heatmap.shape
-    device = logits_heatmap.device
     probs = torch.sigmoid(logits_heatmap).view(B * T, -1)
     probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
     probs = probs.view(B, T, H, W)
-    y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    y_grid, x_grid = torch.meshgrid(torch.arange(H, device=probs.device), torch.arange(W, device=probs.device),
+                                    indexing='ij')
     y_center = (probs * y_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
     x_center = (probs * x_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
     return torch.stack([x_center, y_center], dim=2)
 
 
-def run_training():
-    wandb.init(
-        project="STATERA",
-        name="5K-Temporal-Crescent-PoC",
-        tags=["5K", "PoC", "Crescent-Curriculum", "No-Magnitude"]
-    )
+def save_metrics(run_name, h_loss, z_loss, pixel_err):
+    metrics_file = "run_metrics.json"
+    data = {}
+    if os.path.exists(metrics_file):
+        with open(metrics_file, 'r') as f:
+            data = json.load(f)
+    data[run_name] = {"val_heatmap_loss": h_loss, "val_z_loss": z_loss, "val_pixel_error": pixel_err}
+    with open(metrics_file, 'w') as f:
+        json.dump(data, f, indent=4)
 
-    if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+
+def main():
+    args = parse_args()
+    log_file = f"{args.wandb_name}_train.log"
+
+    def log(msg):
+        print(msg)
+        with open(log_file, "a") as f: f.write(msg + "\n")
+
+    wandb.init(project="STATERA-Ablations", name=args.wandb_name, config=vars(args))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log_print(f"Hardware allocated: {device}")
+    log(f"Initialized {args.wandb_name} on {device}")
 
-    full_dataset = StateraDataset('../sim/statera_poc.hdf5')
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
+    try:
+        start_sigma = 3.0 if args.static_sigma else 12.5
+        dataset = StateraDataset('../sim/statera_poc.hdf5', target_type=args.target_type, start_sigma=start_sigma)
+        train_size = int(0.8 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
 
-    generator = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+        train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=24, shuffle=False, num_workers=4, pin_memory=True)
 
-    BATCH_SIZE = 24
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+        model = StateraModel(
+            decoder_type=args.decoder_type, temporal_mixer=args.temporal_mixer,
+            single_task=args.single_task, backbone_type=args.backbone, scratch=args.scratch
+        ).to(device)
 
-    model = StateraModel().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        criterion_h = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
+        criterion_z = nn.HuberLoss()
 
-    # Simplified Metrics
-    criterion_h = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
-    criterion_z = nn.HuberLoss()
+        epochs = 35  # Strictly exactly 35 epochs per prompt request
+        train_h_losses, val_h_losses = [], []
+        best_val_err = float('inf')
 
-    log_print("STATERA PoC Temporal Tracking Training Started...")
+        for epoch in range(epochs):
+            if not args.static_sigma:
+                current_sigma = max(3.0, 12.5 - (9.5) * (epoch / 25.0))
+                train_ds.dataset.update_sigma(current_sigma)
 
-    epochs = 50
-    best_val_loss = float('inf')
-    patience = 6
-    patience_counter = 0
+            if args.target_type in ['blend', 'crescent']:
+                train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
 
-    train_h_losses, train_z_losses = [], []
-    val_h_losses, val_z_losses = [], []
-    global_start_time = time.time()
+            model.train()
+            run_h, run_z = 0.0, 0.0
 
-    start_sigma = 12.5
-    end_sigma = 3.0
-    decay_epochs = 30
-
-    for epoch in range(epochs):
-        # The Dual Curriculum: Shrink the Sigma & Tighten the Crescent Phase
-        current_sigma = start_sigma - (start_sigma - end_sigma) * (epoch / decay_epochs) if epoch < decay_epochs else end_sigma
-        current_alpha = min(1.0, epoch / 30.0)
-
-        # Applying the setters (accessing the underlying full_dataset inside the Subset)
-        train_dataset.dataset.update_sigma(current_sigma)
-        train_dataset.dataset.update_phase_alpha(current_alpha)
-
-        epoch_start_time = time.time()
-        model.train()
-        running_h_loss, running_z_loss = 0.0, 0.0
-        interval_start = time.time()
-
-        for i, (vids, gt_h, gt_z) in enumerate(train_loader):
-            vids, gt_h = vids.to(device, non_blocking=True), gt_h.to(device, non_blocking=True)
-            gt_z = gt_z.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            pred_h, pred_z = model(vids)
-
-            # EXPONENTIAL TEMPORAL PROGRESSIVE WEIGHTING
-            weighted_loss_h, weighted_loss_z = 0.0, 0.0
-
-            for f in range(16):
-                temporal_weight = (f / 15.0) ** 2
-                weighted_loss_h += criterion_h(pred_h[:, f], gt_h[:, f]) * temporal_weight
-                weighted_loss_z += criterion_z(pred_z[:, f], gt_z[:, f]) * temporal_weight
-
-            total_loss = weighted_loss_h + (0.1 * weighted_loss_z)
-            total_loss.backward()
-            optimizer.step()
-
-            running_h_loss += weighted_loss_h.item()
-            running_z_loss += weighted_loss_z.item()
-
-            if i % 10 == 0:
-                elapsed_time = time.time() - interval_start
-                interval_start = time.time()
-                time_label = "1st batch" if i == 0 else "10 batches"
-                log_print(f"Epoch[{epoch + 1}/{epochs}] | Train Batch[{i}/{len(train_loader)}] "
-                          f"| Time ({time_label}): {elapsed_time:.2f}s "
-                          f"| Loss: {total_loss.item():.4f} (wH: {weighted_loss_h.item():.4f}, wZ: {weighted_loss_z.item():.4f})")
-
-        # ==========================================
-        #              VALIDATION PHASE
-        # ==========================================
-        model.eval()
-        val_running_h, val_running_z = 0.0, 0.0
-        total_pixel_error = 0.0
-
-        with torch.no_grad():
-            for vids, gt_h, gt_z in val_loader:
-                vids, gt_h = vids.to(device, non_blocking=True), gt_h.to(device, non_blocking=True)
-                gt_z = gt_z.to(device, non_blocking=True)
-
+            for vids, gt_h, gt_z in train_loader:
+                vids, gt_h, gt_z = vids.to(device), gt_h.to(device), gt_z.to(device)
+                optimizer.zero_grad()
                 pred_h, pred_z = model(vids)
 
-                weighted_val_h, weighted_val_z = 0.0, 0.0
-
+                w_h, w_z = 0.0, 0.0
                 for f in range(16):
-                    w = (f / 15.0) ** 2
-                    weighted_val_h += criterion_h(pred_h[:, f], gt_h[:, f]) * w
-                    weighted_val_z += criterion_z(pred_z[:, f], gt_z[:, f]) * w
+                    w = 1.0 if args.temporal_weighting == 'uniform' else (f / 15.0) ** 2
+                    w_h += criterion_h(pred_h[:, f], gt_h[:, f]) * w
+                    if not args.single_task:
+                        w_z += criterion_z(pred_z[:, f], gt_z[:, f]) * w
 
-                val_running_h += weighted_val_h.item()
-                val_running_z += weighted_val_z.item()
+                loss = w_h + (0.1 * w_z if not args.single_task else 0.0)
+                loss.backward()
+                optimizer.step()
 
-                pred_coords = get_subpixel_coords(pred_h)
+                run_h += w_h.item()
+                run_z += w_z.item()
 
-                # GT coords extraction across sequence
-                B, T, H_res, W_res = gt_h.shape
-                flat_gt = gt_h.view(B * T, -1)
-                idx = flat_gt.argmax(dim=1)
-                gt_coords = torch.stack([idx % W_res, idx // W_res], dim=1).float().view(B, T, 2)
+            # Validation
+            model.eval()
+            val_h, val_z, total_px_err = 0.0, 0.0, 0.0
+            with torch.no_grad():
+                for vids, gt_h, gt_z in val_loader:
+                    vids, gt_h, gt_z = vids.to(device), gt_h.to(device), gt_z.to(device)
+                    pred_h, pred_z = model(vids)
 
-                pixel_dist = torch.norm(pred_coords - gt_coords, dim=2).mean().item()
-                total_pixel_error += pixel_dist
+                    for f in range(16):
+                        w = 1.0 if args.temporal_weighting == 'uniform' else (f / 15.0) ** 2
+                        val_h += criterion_h(pred_h[:, f], gt_h[:, f]).item() * w
+                        if not args.single_task:
+                            val_z += criterion_z(pred_z[:, f], gt_z[:, f]).item() * w
 
-        avg_train_h = running_h_loss / len(train_loader)
-        avg_train_z = running_z_loss / len(train_loader)
+                    # Calculate Pixel Error
+                    pred_coords = get_subpixel_coords(pred_h)
+                    B, T, H_res, W_res = gt_h.shape
+                    idx = gt_h.view(B * T, -1).argmax(dim=1)
+                    gt_coords = torch.stack([idx % W_res, idx // W_res], dim=1).float().view(B, T, 2)
+                    total_px_err += torch.norm(pred_coords - gt_coords, dim=2).mean().item()
 
-        avg_val_h = val_running_h / len(val_loader)
-        avg_val_z = val_running_z / len(val_loader)
+            avg_val_h = val_h / len(val_loader)
+            avg_val_z = val_z / len(val_loader)
+            avg_px_err = total_px_err / len(val_loader)
 
-        avg_pixel_err = total_pixel_error / len(val_loader)
+            train_h_losses.append(run_h / len(train_loader))
+            val_h_losses.append(avg_val_h)
 
-        train_total_loss = avg_train_h + (0.1 * avg_train_z)
-        val_total_loss = avg_val_h + (0.1 * avg_val_z)
+            log(f"Epoch [{epoch + 1}/{epochs}] | Val Heatmap Loss: {avg_val_h:.4f} | Val Pixel Error: {avg_px_err * (384 / 64):.2f} px")
+            wandb.log({"val/heatmap_loss": avg_val_h, "val/z_loss": avg_val_z,
+                       "metrics/pixel_error": avg_px_err * (384 / 64)})
 
-        train_h_losses.append(avg_train_h)
-        train_z_losses.append(avg_train_z)
-        val_h_losses.append(avg_val_h)
-        val_z_losses.append(avg_val_z)
+        # Save individual run graph locally
+        plt.figure()
+        plt.plot(train_h_losses, label='Train Heatmap Loss')
+        plt.plot(val_h_losses, label='Val Heatmap Loss')
+        plt.title(f"{args.wandb_name} Loss Curve")
+        plt.legend()
+        plt.savefig(f"{args.wandb_name}_loss.png")
+        plt.close()
 
-        wandb.log({
-            "epoch": epoch + 1,
-            "lr": optimizer.param_groups[0]['lr'],
-            "sigma": current_sigma,
-            "phase_alpha": current_alpha,
-            "train/heatmap_loss": avg_train_h,
-            "train/z_loss": avg_train_z,
-            "train/total_loss": train_total_loss,
-            "val/heatmap_loss": avg_val_h,
-            "val/z_loss": avg_val_z,
-            "val/total_loss": val_total_loss,
-            "metrics/pixel_error_internal": avg_pixel_err,
-            "metrics/pixel_error_true": avg_pixel_err * (384.0 / 64.0)
-        })
+        save_metrics(args.wandb_name, avg_val_h, avg_val_z, avg_px_err * (384 / 64))
+        log("Run completed successfully.")
 
-        saved_flag = ""
-        # -------------------------------------------------------------
-        # PROTECTED RUNWAY EARLY STOPPING LOGIC
-        # -------------------------------------------------------------
-        if val_total_loss < best_val_loss:
-            best_val_loss = val_total_loss
-            patience_counter = 0
-            probe_state = {k: v for k, v in model.state_dict().items() if model.get_parameter(k).requires_grad}
-            torch.save(probe_state, 'best_statera_probe.pth')
-            saved_flag = "✓[Checkpoint Saved]"
-        else:
-            # Patience ONLY ticks if Epoch >= 40 guaranteeing a 10-Epoch Dot-Lock-In Runway
-            if epoch >= 40:
-                patience_counter += 1
-                saved_flag = f"![No Improvement: Patience {patience_counter}/{patience}]"
-            else:
-                saved_flag = "![Ignored: Protected Runway]"
+    except Exception as e:
+        log(f"CRITICAL ERROR ENCOUNTERED: {e}")
+        log(traceback.format_exc())
+        save_metrics(args.wandb_name, 999.0, 999.0, 999.0)  # Mark as failed in JSON but allow bash to continue
 
-        scale_factor = 384.0 / 64.0
-        true_video_error = avg_pixel_err * scale_factor
-        epoch_time = time.time() - epoch_start_time
-
-        log_print(f"=== Epoch {epoch + 1} Completed in {epoch_time:.1f}s | Sigma: {current_sigma:.2f} | Alpha: {current_alpha:.2f} ===")
-        log_print(f"Train - wHeatmap: {avg_train_h:.4f} | wZ-Depth: {avg_train_z:.4f}")
-        log_print(f"Val   - wHeatmap: {avg_val_h:.4f} | wZ-Depth: {avg_val_z:.4f} {saved_flag}")
-        log_print(
-            f"➔ PHYSICAL SCRUTINY: Missed CoM by {avg_pixel_err:.2f} internal pixels -> ~{true_video_error:.1f} pixels on ACTUAL 384x384 video.\n")
-
-        if patience_counter >= patience:
-            log_print(f"!! Early stopping triggered! Validation loss plateaued for {patience} epochs post-runway.")
-            break
-
-    total_time = (time.time() - global_start_time) / 60
-    log_print(f"✓ Training completed in {total_time:.2f} minutes.")
-
-    # ==========================================
-    #           GENERATE CONVERGENCE PLOTS
-    # ==========================================
-    log_print("Generating training plots...")
-    plt.figure(figsize=(12, 5))
-
-    actual_epochs = len(train_h_losses)
-    plot_epochs = range(2, actual_epochs + 1) if actual_epochs > 1 else [1]
-    slice_idx = 1 if actual_epochs > 1 else 0
-
-    plt.subplot(1, 2, 1)
-    plt.plot(plot_epochs, train_h_losses[slice_idx:], marker='o', color='b', label='Train')
-    plt.plot(plot_epochs, val_h_losses[slice_idx:], marker='o', color='c', linestyle='dashed', label='Val')
-    plt.title('Weighted BCE Heatmap Loss')
-    plt.grid(True)
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(plot_epochs, train_z_losses[slice_idx:], marker='s', color='r', label='Train')
-    plt.plot(plot_epochs, val_z_losses[slice_idx:], marker='s', color='m', linestyle='dashed', label='Val')
-    plt.title('Weighted Z-Depth Loss')
-    plt.grid(True)
-    plt.legend()
-
-    plt.tight_layout()
-    plot_filename = 'statera_temporal_loss.png'
-    plt.savefig(plot_filename)
-    plt.close()
-    log_print(f"✓ Training plots saved to '{plot_filename}'")
-    log_print(f"✓ Best model weights saved to 'best_statera_probe.pth'")
-
-    wandb.finish()
+    finally:
+        wandb.finish()
 
 
 if __name__ == "__main__":
-    if not os.path.exists('../sim/statera_poc.hdf5'):
-        print("✘ Error: statera_poc.hdf5 not found in ../sim/")
-    else:
-        run_training()
+    main()
