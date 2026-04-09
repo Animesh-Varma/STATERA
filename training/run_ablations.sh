@@ -1,16 +1,15 @@
 #!/bin/bash
-echo "🚀 Pre-Flight Check..."
+echo "Pre-Flight Check..."
 python validate_pipeline.py
 if [ $? -ne 0 ]; then
     echo "Pre-flight failed! Aborting ablations."
     exit 1
 fi
 
-echo "🚀 Initiating 13-Run STATERA Ablation Pipeline..."
+echo "Initiating 16-Run STATERA Ablation Pipeline..."
 echo "{}" > run_metrics.json
 
 # Original 10 Runs
-python train.py --decoder_type mlp --target_type dot --wandb_name Run-1-Baseline-MLP
 python train.py --decoder_type deconv --target_type dot --wandb_name Run-2-Deconv-Spatial
 python train.py --decoder_type deconv --target_type blend --wandb_name Run-3-Curriculum-Blend
 python train.py --decoder_type deconv --target_type crescent --wandb_name Run-4-Curriculum-Crescent
@@ -25,5 +24,9 @@ python train.py --decoder_type regression --target_type dot --wandb_name Run-11-
 python train.py --decoder_type deconv --target_type crescent --temporal_mixer none --wandb_name Run-12-No-Temporal-Mixer
 python train.py --decoder_type deconv --target_type crescent --loss_type focal --wandb_name Run-13-Focal-Loss
 
-echo "🏁 All Ablation Runs Terminated. Generating Analysis Tables..."
+python train.py --decoder_type deconv --target_type crescent --temporal_dropout 0.25 --wandb_name Run-14-Temporal-Dropout
+python train.py --decoder_type deconv --target_type crescent --jitter_box --wandb_name Run-15-Prompt-Jitter
+python train.py --decoder_type deconv --target_type crescent --finetune_blocks 2 --wandb_name Run-16-Partial-Finetune
+
+echo "All Ablation Runs Terminated. Generating Analysis Tables..."
 python generate_table.py

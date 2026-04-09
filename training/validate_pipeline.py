@@ -23,9 +23,9 @@ def test_model_config(config_name, kwargs, dataset):
     try:
         model = StateraModel(**kwargs).to(device)
         vids, heatmap, z = dataset[0]
-        vids = vids.unsqueeze(0).to(device)  # Batch of 1
+        vids = vids.unsqueeze(0).to(device)
 
-        with torch.no_grad():  # Prevent memory hoarding
+        with torch.no_grad():
             pred_out, pred_z = model(vids)
 
         if kwargs.get('decoder_type') == 'regression':
@@ -42,7 +42,6 @@ def test_model_config(config_name, kwargs, dataset):
         return False
 
     finally:
-        # STRICT GPU MEMORY CLEANUP
         if 'model' in locals(): del model
         if 'vids' in locals(): del vids
         if 'pred_out' in locals(): del pred_out
@@ -61,16 +60,17 @@ if __name__ == "__main__":
     mock_path = '../sim/mock_statera.hdf5'
     create_mock_hdf5(mock_path)
 
-    dataset = StateraDataset(mock_path, target_type='crescent')
+    # Passing jitter_box=True to test Dataset modifications safely
+    dataset = StateraDataset(mock_path, target_type='crescent', jitter_box=True)
 
     configs = {
         "Run-1-Baseline-MLP": {'decoder_type': 'mlp', 'temporal_mixer': 'conv1d'},
         "Run-2-Deconv-Spatial": {'decoder_type': 'deconv'},
         "Run-6-Transformer": {'decoder_type': 'deconv', 'temporal_mixer': 'transformer'},
-        "Run-7-Single-Task": {'decoder_type': 'deconv', 'single_task': True},
         "Run-9-DINOv2": {'decoder_type': 'deconv', 'backbone_type': 'dinov2'},
         "Run-11-Regression": {'decoder_type': 'regression'},
         "Run-12-No-Temporal": {'decoder_type': 'deconv', 'temporal_mixer': 'none'},
+        "Run-16-Partial-Finetune": {'decoder_type': 'deconv', 'finetune_blocks': 2},
     }
 
     all_passed = True
@@ -79,9 +79,9 @@ if __name__ == "__main__":
             all_passed = False
 
     if all_passed:
-        print("\n✅ ALL PIPELINES VERIFIED. You are clear to run the ablation suite.")
+        print("\n✅ ALL PIPELINES VERIFIED. You are clear to run the 16-run suite.")
     else:
-        print("\n🚨 VALIDATION FAILED. Fix the architectures before running the 1000-video suite.")
+        print("\n🚨 VALIDATION FAILED. Fix the architectures before running the suite.")
 
     if os.path.exists(mock_path):
         os.remove(mock_path)

@@ -1,15 +1,17 @@
 import torch
 from torch.utils.data import Dataset
 import h5py
+import numpy as np
 
 
 class StateraDataset(Dataset):
-    def __init__(self, h5_path, target_type='crescent', heatmap_res=64, start_sigma=12.5):
+    def __init__(self, h5_path, target_type='crescent', heatmap_res=64, start_sigma=12.5, jitter_box=False):
         self.h5_path = h5_path
         self.heatmap_res = heatmap_res
         self.sigma = start_sigma
         self.phase_alpha = 0.0
-        self.target_type = target_type  # 'dot', 'blend', or 'crescent'
+        self.target_type = target_type
+        self.jitter_box = jitter_box  # NEW: For Spatial Robustness Ablation
 
         print(f"Loading dataset into RAM...")
         with h5py.File(self.h5_path, 'r') as f:
@@ -39,10 +41,16 @@ class StateraDataset(Dataset):
 
     def __getitem__(self, idx):
         video = torch.from_numpy(self.videos[idx]).float() / 255.0
-        video = video.permute(1, 0, 2, 3)  # [16, C, H, W]
+        video = video.permute(1, 0, 2, 3)
 
         uv_np = self.uv_coords[idx].reshape(16, 2)
         box_np = self.box_center_uv[idx].reshape(16, 2)
+
+        # RUN 15: PROMPT JITTER (Add ±5 pixels of random noise to bounding box center)
+        if self.jitter_box:
+            noise = np.random.uniform(-5.0, 5.0, size=box_np.shape)
+            box_np = box_np + noise
+
         z_depth = torch.tensor(self.z_depths[idx].flatten(), dtype=torch.float32).view(16, 1)
 
         scale = self.heatmap_res / 384.0
@@ -51,7 +59,6 @@ class StateraDataset(Dataset):
         u_c = torch.tensor(box_np[:, 0] * scale, dtype=torch.float32).view(16, 1, 1)
         v_c = torch.tensor(box_np[:, 1] * scale, dtype=torch.float32).view(16, 1, 1)
 
-        # Distances
         dx_c = self.grid_x.unsqueeze(0) - u_c
         dy_c = self.grid_y.unsqueeze(0) - v_c
         grid_dist_c = torch.sqrt(dx_c ** 2 + dy_c ** 2 + 1e-8)
@@ -62,7 +69,6 @@ class StateraDataset(Dataset):
 
         R_true = torch.sqrt((u_t - u_c) ** 2 + (v_t - v_c) ** 2 + 1e-8)
 
-        # Base Forms
         dot = torch.exp(-(grid_dist_t ** 2) / (2 * self.sigma ** 2))
         ring = torch.exp(-((grid_dist_c - R_true) ** 2) / (2 * self.sigma ** 2))
 

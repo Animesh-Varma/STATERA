@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 class StateraModel(nn.Module):
     def __init__(self, decoder_type='mlp', temporal_mixer='conv1d',
-                 single_task=False, backbone_type='vjepa', scratch=False, heatmap_res=64):
+                 single_task=False, backbone_type='vjepa', scratch=False,
+                 finetune_blocks=0, heatmap_res=64):
         super().__init__()
         self.heatmap_res = heatmap_res
         self.decoder_type = decoder_type
@@ -13,6 +14,7 @@ class StateraModel(nn.Module):
         self.single_task = single_task
         self.backbone_type = backbone_type
         self.scratch = scratch
+        self.finetune_blocks = finetune_blocks
 
         if self.backbone_type == 'vjepa':
             hub_out = torch.hub.load('facebookresearch/vjepa2', 'vjepa2_1_vit_large_384')
@@ -30,7 +32,14 @@ class StateraModel(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-        # Temporal Mixer Toggle
+            if self.finetune_blocks > 0 and hasattr(self.backbone, 'blocks'):
+                for block in self.backbone.blocks[-self.finetune_blocks:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+                if hasattr(self.backbone, 'norm'):
+                    for param in self.backbone.norm.parameters():
+                        param.requires_grad = True
+
         if self.temporal_mixer == 'conv1d':
             self.temp_net = nn.Sequential(nn.Conv1d(self.embed_dim, self.embed_dim, kernel_size=3, padding=1),
                                           nn.GELU())
@@ -40,7 +49,6 @@ class StateraModel(nn.Module):
         elif self.temporal_mixer == 'none':
             self.temp_net = nn.Identity()
 
-            # Spatial Decoder Toggle
         if self.decoder_type in ['mlp', 'regression']:
             self.pooler = nn.Sequential(nn.Linear(self.embed_dim, 256), nn.Tanh(), nn.Linear(256, 1), nn.Softmax(dim=2))
             self.funnel = nn.Sequential(nn.Linear(self.embed_dim, 512), nn.GELU(), nn.Linear(512, 256), nn.GELU())
@@ -71,13 +79,13 @@ class StateraModel(nn.Module):
 
     def forward(self, x):
         B = x.shape[0]
-        enable_grad = self.scratch and self.training
+        enable_grad = (self.scratch or self.finetune_blocks > 0) and self.training
 
         if self.backbone_type == 'vjepa':
             with torch.set_grad_enabled(enable_grad):
                 tokens = self.backbone(x)
                 if isinstance(tokens, tuple): tokens = tokens[0]
-            tokens = tokens.view(B, 8, 576, self.embed_dim)
+            tokens = tokens.reshape(B, 8, 576, self.embed_dim)
             T_current = 8
 
         elif self.backbone_type == 'dinov2':
@@ -97,66 +105,50 @@ class StateraModel(nn.Module):
             tokens = tokens.reshape(B, 16, self.embed_dim, 576).permute(0, 1, 3, 2)
             T_current = 16
 
-        # Spatial Pool
         if self.decoder_type in ['mlp', 'regression']:
             weights = self.pooler(tokens)
             feat = torch.sum(tokens * weights, dim=2)
         else:
             feat = tokens
 
-        # -------------------------------------------------------------------
-        # CORRECTED: Temporal Mixing (Treating Patches as independent Batches)
-        # -------------------------------------------------------------------
         if self.temporal_mixer in ['conv1d', 'transformer', 'none']:
             if self.decoder_type in ['mlp', 'regression']:
-                # feat is [B, T, C]
                 if self.temporal_mixer == 'conv1d':
                     feat = self.temp_net(feat.transpose(1, 2)).transpose(1, 2)
                 elif self.temporal_mixer == 'transformer':
                     feat = self.temp_net(feat)
             else:
-                # feat is [B, T, P, C]. We want to temporally mix over T.
                 B, T, P, C = feat.shape
-
                 if self.temporal_mixer == 'conv1d':
-                    # [B, T, P, C] -> [B, P, T, C] -> [B*P, T, C] -> [B*P, C, T]
                     feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C).permute(0, 2, 1)
                     feat_flat = self.temp_net(feat_flat)
-                    # [B*P, C, T] -> [B*P, T, C] -> [B, P, T, C] -> [B, T, P, C]
                     feat = feat_flat.permute(0, 2, 1).reshape(B, P, T, C).permute(0, 2, 1, 3)
-
                 elif self.temporal_mixer == 'transformer':
-                    # [B, T, P, C] -> [B, P, T, C] -> [B*P, T, C]
                     feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C)
                     feat_flat = self.temp_net(feat_flat)
-                    # [B*P, T, C] -> [B, P, T, C] -> [B, T, P, C]
                     feat = feat_flat.reshape(B, P, T, C).permute(0, 2, 1, 3)
 
-        # -------------------------------------------------------------------
-        # CORRECTED: Temporal Upscale 8 -> 16
-        # -------------------------------------------------------------------
         if T_current == 8:
             if self.decoder_type in ['mlp', 'regression']:
                 feat = F.interpolate(feat.transpose(1, 2), size=16, mode='linear').transpose(1, 2)
             else:
                 B, T, P, C = feat.shape
-                feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C).permute(0, 2, 1)  # [B*P, C, T=8]
-                feat_flat = F.interpolate(feat_flat, size=16, mode='linear')  # [B*P, C, T=16]
-                feat = feat_flat.permute(0, 2, 1).reshape(B, P, 16, C).permute(0, 2, 1, 3)  # [B, 16, P, C]
+                feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C).permute(0, 2, 1)
+                feat_flat = F.interpolate(feat_flat, size=16, mode='linear')
+                feat = feat_flat.permute(0, 2, 1).reshape(B, P, 16, C).permute(0, 2, 1, 3)
 
-        # Decode
         out = None
         if self.decoder_type == 'mlp':
             feat_condensed = self.funnel(feat)
-            out = self.heatmap_head(feat_condensed).view(B, 16, self.heatmap_res, self.heatmap_res)
+            out = self.heatmap_head(feat_condensed).reshape(B, 16, self.heatmap_res, self.heatmap_res)
             z_feat = feat_condensed
         elif self.decoder_type == 'regression':
             feat_condensed = self.funnel(feat)
             out = self.coord_head(feat_condensed)
             z_feat = feat_condensed
         elif self.decoder_type == 'deconv':
-            grid_feat = feat.view(B * 16, 24, 24, self.embed_dim).permute(0, 3, 1, 2)
-            out = self.deconv_net(grid_feat).view(B, 16, self.heatmap_res, self.heatmap_res)
+            grid_feat = feat.reshape(B * 16, 24, 24, self.embed_dim).permute(0, 3, 1, 2)
+            out = self.deconv_net(grid_feat).reshape(B, 16, self.heatmap_res, self.heatmap_res)
             if not self.single_task:
                 z_w = self.z_pooler(feat)
                 z_pooled = torch.sum(feat * z_w, dim=2)

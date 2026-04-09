@@ -1,0 +1,77 @@
+{
+    "Run-2-Deconv-Spatial": {
+        "val_heatmap_loss": 0.8866913474121212,
+        "val_z_loss": 0.6348252763847513,
+        "val_pixel_error": 19.753626982371014
+    },
+    "Run-3-Curriculum-Blend": {
+        "val_heatmap_loss": 0.781549038555887,
+        "val_z_loss": 0.7691801825680851,
+        "val_pixel_error": 19.751053969065346
+    },
+    "Run-4-Curriculum-Crescent": {
+        "val_heatmap_loss": 0.5170763883969668,
+        "val_z_loss": 0.6182054294921732,
+        "val_pixel_error": 24.401217142740887
+    },
+    "Run-5-Uniform-Temporal": {
+        "val_heatmap_loss": 1.385844903273715,
+        "val_z_loss": 1.742542711397012,
+        "val_pixel_error": 23.109236081441242
+    },
+    "Run-6-Transformer-Mixer": {
+        "val_heatmap_loss": 0.596386640390423,
+        "val_z_loss": 0.7058063949965764,
+        "val_pixel_error": 24.206629657745363
+    },
+    "Run-7-Single-Task": {
+        "val_heatmap_loss": 0.6694130420059335,
+        "val_z_loss": 0.0,
+        "val_pixel_error": 24.982171217600502
+    },
+    "Run-8-Static-Sigma": {
+        "val_heatmap_loss": 0.43937718370814394,
+        "val_z_loss": 0.7752958298483748,
+        "val_pixel_error": 23.34430201848348
+    },
+    "Run-9-DINOv2": {
+        "val_heatmap_loss": 0.45438840149361426,
+        "val_z_loss": 1.3491575921464856,
+        "val_pixel_error": 45.86095269521078
+    },
+    "Run-10-Scratch": {
+        "val_heatmap_loss": 999.0,
+        "val_z_loss": 999.0,
+        "val_pixel_error": 999.0
+    },
+    "Run-11-Direct-Regression": {
+        "val_heatmap_loss": 129.37343164938466,
+        "val_z_loss": 3.2078034009756853,
+        "val_pixel_error": 41.29980913798015
+    },
+    "Run-12-No-Temporal-Mixer": {
+        "val_heatmap_loss": 0.343522096603741,
+        "val_z_loss": 0.9400218092548995,
+        "val_pixel_error": 23.178332010904946
+    },
+    "Run-13-Focal-Loss": {
+        "val_heatmap_loss": 0.3866841369223447,
+        "val_z_loss": 0.7198110768971618,
+        "val_pixel_error": 37.88344065348307
+    },
+    "Run-14-Temporal-Dropout": {
+        "val_heatmap_loss": 0.36760291134501677,
+        "val_z_loss": 0.6372907111471816,
+        "val_pixel_error": 23.68357801437378
+    },
+    "Run-15-Prompt-Jitter": {
+        "val_heatmap_loss": 0.46065073519761157,
+        "val_z_loss": 0.6528144432126004,
+        "val_pixel_error": 23.792255401611328
+    },
+    "Run-16-Partial-Finetune": {
+        "val_heatmap_loss": 1.0868508709867803,
+        "val_z_loss": 0.4401073999619318,
+        "val_pixel_error": 24.168003616333007
+    }
+}
