@@ -4,6 +4,7 @@ Sim-to-Real Dataset Generator.
 *FINAL FIX*: Automatically translates MuJoCo (Z-Up) Center of Mass coordinates
 into OpenCV (Y-Down) coordinates AND inverts the X-axis to correct for
 physical ArUco face mirroring. Includes Scalar Magnitude extraction.
+Added: Toggle to keep ArUco markers visible, and global crop for Z-Depth.
 """
 
 import cv2
@@ -47,6 +48,11 @@ def process_directory():
     print(" STATERA: Kinematics Batch Extraction Setup")
     print("="*60)
 
+    # ==========================================
+    # TOGGLE: Set to True to blur ArUco markers, False to keep them visible
+    # ==========================================
+    HIDE_MARKERS = False
+
     marker_size_cm = get_var('marker_size_cm', 'Target black marker size in cm', float, 10.0)
     box_size_cm = get_var('box_size_cm', 'Box dimensions X, Y, Z in cm', list, [15.0, 15.0, 15.0])
 
@@ -76,7 +82,7 @@ def process_directory():
 
     opencv_com_offset_m = [cv_x, cv_y, cv_z]
 
-    # NEW: Calculate 3D Scalar Magnitude
+    # Calculate 3D Scalar Magnitude
     true_com_mag_m = math.sqrt(cv_x**2 + cv_y**2 + cv_z**2)
 
     bx, by, bz = [v / 100.0 for v in box_size_cm]
@@ -132,10 +138,16 @@ def process_directory():
 
         continuous_buffer = []
         original_frame_count = 0
+        frame_h, frame_w = 0, 0
+        prev_rvec = None
+        prev_tvec = None
 
         while True:
             ret, frame = cap.read()
             if not ret: break
+
+            if frame_h == 0:
+                frame_h, frame_w = frame.shape[:2]
 
             corners, ids, _ = detector.detectMarkers(frame)
             detection_success = False
@@ -153,17 +165,37 @@ def process_directory():
                             img_points.append(corners[i][0][j])
 
                 if len(img_points) >= 4:
-                    _, rvec, tvec = cv2.solvePnP(
-                        np.array(obj_points, dtype=np.float32),
-                        np.array(img_points, dtype=np.float32),
-                        mtx, dist
-                    )
+                    # Temporal PnP Logic
+                    obj_pts_np = np.array(obj_points, dtype=np.float32)
+                    img_pts_np = np.array(img_points, dtype=np.float32)
+
+                    if prev_rvec is None or prev_tvec is None:
+                        _, rvec, tvec = cv2.solvePnP(obj_pts_np, img_pts_np, mtx, dist)
+                    else:
+                        _, rvec, tvec = cv2.solvePnP(
+                            obj_pts_np,
+                            img_pts_np,
+                            mtx,
+                            dist,
+                            rvec=prev_rvec.copy(),
+                            tvec=prev_tvec.copy(),
+                            useExtrinsicGuess=True
+                        )
+
+                    # Update state for the next frame
+                    prev_rvec = rvec
+                    prev_tvec = tvec
 
                     com_3d = np.array([opencv_com_offset_m], dtype=np.float32)
                     com_2d, _ = cv2.projectPoints(com_3d, rvec, tvec, mtx, dist)
                     com_u, com_v = com_2d[0][0]
 
-                    clean_frame = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
+                    # TOGGLE LOGIC: Show or Hide ArUco markers
+                    if HIDE_MARKERS:
+                        clean_frame = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
+                    else:
+                        clean_frame = frame.copy()
+
                     box_2d, _ = cv2.projectPoints(box_3d, rvec, tvec, mtx, dist)
 
                     continuous_buffer.append({
@@ -181,6 +213,9 @@ def process_directory():
                 if len(continuous_buffer) > 0:
                     print(f"   [!] Lost tracking after {len(continuous_buffer)} frames. Resetting streak...")
                 continuous_buffer = []
+                # Reset the temporal state
+                prev_rvec = None
+                prev_tvec = None
 
             if len(continuous_buffer) == max_frames:
                 print(f"   [OK] Found continuous {max_frames}-frame chunk! Calculating static crop...")
@@ -195,18 +230,24 @@ def process_directory():
                 all_xs.extend(item["box_2d"][:, 0, 0])
                 all_ys.extend(item["box_2d"][:, 0, 1])
 
-            global_min_x, global_max_x = int(np.min(all_xs)), int(np.max(all_xs))
-            global_min_y, global_max_y = int(np.min(all_ys)), int(np.max(all_ys))
+            cx, cy = (int(np.min(all_xs)) + int(np.max(all_xs))) // 2, (int(np.min(all_ys)) + int(np.max(all_ys))) // 2
 
-            cx, cy = (global_min_x + global_max_x) // 2, (global_min_y + global_max_y) // 2
-            max_dim = max(global_max_x - global_min_x, global_max_y - global_min_y)
-
-            target_size = int(max_dim * 3.0)
-            target_size += target_size % 2
+            # GLOBAL CROP RESTORED: Locks size to the maximum screen square to preserve Absolute Z-Depth Perspective
+            target_size = min(frame_w, frame_h)
             half_size = target_size // 2
 
             x1, y1 = cx - half_size, cy - half_size
             x2, y2 = cx + half_size, cy + half_size
+
+            # Protect bounds
+            if x1 < 0:
+                x2 -= x1; x1 = 0
+            if x2 > frame_w:
+                x1 -= (x2 - frame_w); x2 = frame_w
+            if y1 < 0:
+                y2 -= y1; y1 = 0
+            if y2 > frame_h:
+                y1 -= (y2 - frame_h); y2 = frame_h
 
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out_video = cv2.VideoWriter(out_video_path, fourcc, 60.0, (384, 384))
@@ -234,7 +275,7 @@ def process_directory():
                     "com_u": float(final_com_u),
                     "com_v": float(final_com_v),
                     "z_depth_meters": float(item["tvec"][2][0]),
-                    "com_magnitude_meters": float(true_com_mag_m), # Added to each frame
+                    "com_magnitude_meters": float(true_com_mag_m),
                     "rvec": item["rvec"].flatten().tolist(),
                     "tvec": item["tvec"].flatten().tolist()
                 }
