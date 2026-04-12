@@ -21,5 +21,5 @@ python train.py --decoder_type deconv --target_type twostage --temporal_dropout 
 # Test Run 4: Hero-Unchained
 python train.py --decoder_type deconv --target_type twostage --temporal_dropout 0.25 --finetune_blocks 2 --epochs 50 --metrics_file hero_metrics.json --wandb_name Hero-4-Hero-Unchained
 
-echo "🏁 Hero Runs Terminated. Generating Hero Analysis Tables..."
+echo "Hero Runs Terminated. Generating Hero Analysis Tables..."
 python generate_hero_tables.py
