@@ -6,20 +6,20 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "Initiating 4-Run Hero Phase Pipeline (35 Epochs)..."
+echo "Initiating 4-Run Hero Phase Pipeline (30 Epochs)..."
 echo "{}" > hero_metrics.json
 
 # Test Run 1: Baseline
-python train.py --decoder_type deconv --target_type dot --epochs 35 --static_sigma --metrics_file hero_metrics.json --wandb_name Hero-1-Baseline
+python train.py --decoder_type deconv --target_type dot --epochs 30 --static_sigma --metrics_file hero_metrics.json --wandb_name Hero-1-Baseline
 
 # Test Run 2: TwoStage-Curriculum
-python train.py --decoder_type deconv --target_type twostage --epochs 35 --metrics_file hero_metrics.json --wandb_name Hero-2-TwoStage-Curriculum
+python train.py --decoder_type deconv --target_type twostage --epochs 30 --metrics_file hero_metrics.json --wandb_name Hero-2-TwoStage-Curriculum
 
 # Test Run 3: Hero-Frozen
-python train.py --decoder_type deconv --target_type twostage --temporal_dropout 0.25 --epochs 35 --metrics_file hero_metrics.json --wandb_name Hero-3-Hero-Frozen
+python train.py --decoder_type deconv --target_type twostage --temporal_dropout 0.25 --epochs 30 --metrics_file hero_metrics.json --wandb_name Hero-3-Hero-Frozen
 
 # Test Run 4: Hero-Unchained
-python train.py --decoder_type deconv --target_type twostage --temporal_dropout 0.25 --finetune_blocks 2 --epochs 35 --metrics_file hero_metrics.json --wandb_name Hero-4-Hero-Unchained
+python train.py --decoder_type deconv --target_type twostage --temporal_dropout 0.25 --finetune_blocks 2 --epochs 30 --metrics_file hero_metrics.json --wandb_name Hero-4-Hero-Unchained
 
 echo "Hero Runs Terminated. Generating Hero Analysis Tables..."
 python generate_hero_tables.py
