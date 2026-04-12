@@ -11,7 +11,7 @@ class StateraDataset(Dataset):
         self.sigma = start_sigma
         self.phase_alpha = 0.0
         self.target_type = target_type
-        self.jitter_box = jitter_box  # NEW: For Spatial Robustness Ablation
+        self.jitter_box = jitter_box
 
         print(f"Loading dataset into RAM...")
         with h5py.File(self.h5_path, 'r') as f:
@@ -46,7 +46,6 @@ class StateraDataset(Dataset):
         uv_np = self.uv_coords[idx].reshape(16, 2)
         box_np = self.box_center_uv[idx].reshape(16, 2)
 
-        # RUN 15: PROMPT JITTER (Add ±5 pixels of random noise to bounding box center)
         if self.jitter_box:
             noise = np.random.uniform(-5.0, 5.0, size=box_np.shape)
             box_np = box_np + noise
@@ -54,8 +53,16 @@ class StateraDataset(Dataset):
         z_depth = torch.tensor(self.z_depths[idx].flatten(), dtype=torch.float32).view(16, 1)
 
         scale = self.heatmap_res / 384.0
-        u_t = torch.tensor(uv_np[:, 0] * scale, dtype=torch.float32).view(16, 1, 1)
-        v_t = torch.tensor(uv_np[:, 1] * scale, dtype=torch.float32).view(16, 1, 1)
+
+        # EXTRACT TRUE UV COORDS AT 64x64 SCALE FOR PRECISE PIXEL ERROR
+        true_uv = torch.stack([
+            torch.tensor(uv_np[:, 0] * scale, dtype=torch.float32),
+            torch.tensor(uv_np[:, 1] * scale, dtype=torch.float32)
+        ], dim=1)  # Shape: [16, 2]
+
+        u_t = true_uv[:, 0].view(16, 1, 1)
+        v_t = true_uv[:, 1].view(16, 1, 1)
+
         u_c = torch.tensor(box_np[:, 0] * scale, dtype=torch.float32).view(16, 1, 1)
         v_c = torch.tensor(box_np[:, 1] * scale, dtype=torch.float32).view(16, 1, 1)
 
@@ -95,4 +102,4 @@ class StateraDataset(Dataset):
         else:
             raise ValueError(f"Unknown target type: {self.target_type}")
 
-        return video, heatmap, z_depth
+        return video, heatmap, z_depth, true_uv
