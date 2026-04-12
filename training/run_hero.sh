@@ -1,5 +1,5 @@
 #!/bin/bash
-echo "🚀 Pre-Flight Check for Hero Phase..."
+echo "Pre-Flight Check for Hero Phase..."
 python validate_hero.py
 if [ $? -ne 0 ]; then
     echo "Pre-flight failed! Aborting."
