@@ -1,13 +1,9 @@
 """
 4_evaluate_benchmark.py
-STATERA Benchmarking Script. Ingests the extracted Sim-to-Real MP4s and JSON targets.
-Runs a forward pass to predict the physical state of the ENTIRE 16-FRAME SEQUENCE.
-
-Updates:
-- Evaluates Full Trajectory Error (Frames 1-16) vs Terminal Error (Frame 16).
-- Unpacks third Polar Head (pred_m) to evaluate 3D Scalar Magnitude.
-- Proves kinematic mass tracking dynamically across the whole temporal sequence.
-- Added W&B integration to track Sim-to-Real benchmark progress over time.
+STATERA Benchmarking Script.
+*REFINED*:
+- Evaluates Kinematic Jitter (Acceleration Deviation) to prove temporal smoothness.
+- Dynamically loads exact Crop Bounds from the JSON to align mathematical spaces.
 """
 
 import os
@@ -27,7 +23,6 @@ training_dir = os.path.join(project_root, 'training')
 if training_dir not in sys.path:
     sys.path.append(training_dir)
 
-# noinspection PyUnresolvedReferences
 from model import StateraModel
 
 
@@ -77,7 +72,6 @@ def evaluate_statera():
     print(" STATERA: Temporal Sequence Physics Evaluation")
     print("=" * 60)
 
-    # Initialize W&B for Evaluation Tracking
     wandb.init(project="STATERA", name="Sim-to-Real-Eval", job_type="evaluation")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,16 +102,12 @@ def evaluate_statera():
 
     print(f"[INFO] Discovered {len(mp4_files)} sequences. Starting Audit...\n")
 
-    # Metrics Lists
     traj_spatial_errors, traj_depth_errors, traj_mag_errors = [], [], []
     term_spatial_errors, term_depth_errors, term_mag_errors = [], [], []
-    dist_true_to_centroid_list, dist_pred_to_centroid_list = [], []
+    kinematic_jitter_errors = [] # NEW: Tracks Acceleration Deviation
 
-    # New Vector Math Lists
-    term_mags_true = []
-    term_mags_pred = []
-    term_mag_deltas = []
-    term_angles = []
+    term_mags_true, term_mags_pred = [], []
+    term_mag_deltas, term_angles = [], []
 
     valid_count = 0
 
@@ -145,34 +135,20 @@ def evaluate_statera():
             with open(json_path, 'r') as f:
                 target_data = json.load(f)
 
-            bx, by, bz = target_data["metadata"]["box_size_m"]
-            hx, hy, hz = bx / 2, by / 2, bz / 2
-            box_3d = np.array([
-                [-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
-                [-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]
-            ], dtype=np.float32)
+            crop_params = target_data["metadata"]["crop_params"]
+            x1 = crop_params["x1"]
+            y1 = crop_params["y1"]
+            scale = crop_params["scale"]
 
-            all_xs, all_ys = [], []
-            for f_data in target_data["frames"][:16]:
-                r_v = np.array(f_data["rvec"], dtype=np.float32)
-                t_v = np.array(f_data["tvec"], dtype=np.float32)
-                box_2d, _ = cv2.projectPoints(box_3d, r_v, t_v, mtx, dist)
-                all_xs.extend(box_2d[:, 0, 0])
-                all_ys.extend(box_2d[:, 0, 1])
-
-            cx, cy = (int(np.min(all_xs)) + int(np.max(all_xs))) // 2, (int(np.min(all_ys)) + int(np.max(all_ys))) // 2
-            target_size = int(max(np.max(all_xs) - np.min(all_xs), np.max(all_ys) - np.min(all_ys)) * 3.0)
-            target_size += target_size % 2
-            x1, y1 = cx - (target_size // 2), cy - (target_size // 2)
-            scale = 384.0 / target_size
-
-            # Inference unpacks ONLY 2 variables now!
             pred_h, pred_z = model(vid_tensor)
             sub_uv_seq = get_subpixel_coords(pred_h, device)[0].cpu().numpy() * 6.0
 
             seq_spatial_err = 0.0
             seq_depth_err = 0.0
             seq_mag_err_px = 0.0
+
+            true_traj = []
+            pred_traj = []
 
             for frame_idx in range(16):
                 f_data = target_data["frames"][frame_idx]
@@ -184,48 +160,40 @@ def evaluate_statera():
                 pred_u, pred_v = sub_uv_seq[frame_idx]
                 pred_z_val = abs(float(pred_z[0, frame_idx, 0].item()))
 
-                # CORRECT Center Calculation (Project the exact 3D origin)
+                true_traj.append([target_u, target_v])
+                pred_traj.append([pred_u, pred_v])
+
                 center_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
-                center_2d_f, _ = cv2.projectPoints(center_3d, np.array(f_data["rvec"]), np.array(f_data["tvec"]), mtx,
-                                                   dist)
+                center_2d_f, _ = cv2.projectPoints(center_3d, np.array(f_data["rvec"]), np.array(f_data["tvec"]), mtx, dist)
 
                 centroid_u = (center_2d_f[0][0][0] - x1) * scale
                 centroid_v = (center_2d_f[0][0][1] - y1) * scale
 
-                # General Metrics
                 l2_dist = math.sqrt((pred_u - target_u) ** 2 + (pred_v - target_v) ** 2)
                 abs_z_err = abs(pred_z_val - target_z)
 
-                # NATIVE MAGNITUDE CALCULATION (In Pixels)
                 v_true_f = np.array([target_u - centroid_u, target_v - centroid_v])
                 v_pred_f = np.array([pred_u - centroid_u, pred_v - centroid_v])
                 mag_true_px = np.linalg.norm(v_true_f)
                 mag_pred_px = np.linalg.norm(v_pred_f)
                 abs_m_err_px = abs(mag_pred_px - mag_true_px)
 
-                dist_true_to_centroid = math.sqrt((target_u - centroid_u) ** 2 + (target_v - centroid_v) ** 2)
-                dist_pred_to_centroid = math.sqrt((pred_u - centroid_u) ** 2 + (pred_v - centroid_v) ** 2)
-
                 traj_spatial_errors.append(l2_dist)
                 traj_depth_errors.append(abs_z_err)
-                traj_mag_errors.append(abs_m_err_px)  # Appending Pixels now
-                dist_true_to_centroid_list.append(dist_true_to_centroid)
-                dist_pred_to_centroid_list.append(dist_pred_to_centroid)
+                traj_mag_errors.append(abs_m_err_px)
 
                 seq_spatial_err += l2_dist
                 seq_depth_err += abs_z_err
                 seq_mag_err_px += abs_m_err_px
 
-                # --- 16TH FRAME VECTOR CALCULATIONS ---
                 if frame_idx == 15:
                     term_spatial_errors.append(l2_dist)
                     term_depth_errors.append(abs_z_err)
                     term_mag_errors.append(abs_m_err_px)
 
-                    # 3. Angle (Phase Error) via Cosine Similarity
                     if mag_true_px > 1e-5 and mag_pred_px > 1e-5:
                         cos_theta = np.dot(v_true_f, v_pred_f) / (mag_true_px * mag_pred_px)
-                        cos_theta = np.clip(cos_theta, -1.0, 1.0)  # Prevent float rounding NaNs
+                        cos_theta = np.clip(cos_theta, -1.0, 1.0)
                         angle_deg = math.degrees(math.acos(cos_theta))
                     else:
                         angle_deg = 0.0
@@ -235,29 +203,36 @@ def evaluate_statera():
                     term_mag_deltas.append(mag_pred_px - mag_true_px)
                     term_angles.append(angle_deg)
 
+            # NEW: Kinematic Jitter (2nd Derivative Acceleration Deviation)
+            true_pts = np.array(true_traj)
+            pred_pts = np.array(pred_traj)
+
+            # a_t = p_t - 2*p_{t-1} + p_{t-2}
+            true_accel = true_pts[2:] - 2 * true_pts[1:-1] + true_pts[:-2]
+            pred_accel = pred_pts[2:] - 2 * pred_pts[1:-1] + pred_pts[:-2]
+
+            accel_errors = np.linalg.norm(pred_accel - true_accel, axis=1) # L2 norm of the difference
+            seq_jitter_err = np.mean(accel_errors)
+            kinematic_jitter_errors.append(seq_jitter_err)
+
             avg_seq_spatial = seq_spatial_err / 16.0
-            avg_seq_mag_px = seq_mag_err_px / 16.0  # Print in PX
+            avg_seq_mag_px = seq_mag_err_px / 16.0
             valid_count += 1
 
-            # Print single-sequence preview
-            print(
-                f"   -> [Seq {valid_count:03d}] UV-Err: {avg_seq_spatial:5.2f}px | Mag Err: {avg_seq_mag_px:5.1f}px | Angle Err: {term_angles[-1]:5.1f}°")
+            print(f"   -> [Seq {valid_count:03d}] UV: {avg_seq_spatial:5.2f}px | Mag: {avg_seq_mag_px:5.1f}px | Ang: {term_angles[-1]:5.1f}° | Jitter: {seq_jitter_err:5.2f} px/f²")
 
-            # --- AGGREGATION & PROOF ---
         if valid_count == 0: return
 
-        # Sequence Averages
         mean_traj_spatial = np.mean(traj_spatial_errors)
         mean_traj_depth = np.mean(traj_depth_errors)
-        mean_traj_mag = np.mean(traj_mag_errors)  # Already in PX
+        mean_traj_mag = np.mean(traj_mag_errors)
+        mean_kinematic_jitter = np.mean(kinematic_jitter_errors)
 
-        # Terminal (Frame 16) Averages
         mean_term_spatial = np.mean(term_spatial_errors)
         max_term_spatial = np.max(term_spatial_errors)
         mean_term_depth = np.mean(term_depth_errors)
-        mean_term_mag = np.mean(term_mag_errors)  # Already in PX
+        mean_term_mag = np.mean(term_mag_errors)
 
-        # Vector Math Averages
         mean_mag_true = np.mean(term_mags_true)
         mean_mag_pred = np.mean(term_mags_pred)
         mean_mag_delta = np.mean(term_mag_deltas)
@@ -271,6 +246,7 @@ def evaluate_statera():
         print(f" Mean Trajectory Spatial Error : {mean_traj_spatial:.2f} Pixels")
         print(f" Mean Trajectory Depth Error   : {mean_traj_depth:.4f} Meters")
         print(f" Mean Trajectory Amplitude Err : {mean_traj_mag:.2f} Pixels")
+        print(f" Kinematic Jitter (Accel Err)  : {mean_kinematic_jitter:.3f} px/f²")
         print("\n --- TERMINAL PERFORMANCE (Final Frame 16) ---")
         print(f" Mean Terminal Spatial Error   : {mean_term_spatial:.2f} Pixels")
         print(f" Max Terminal Spatial Error    : {max_term_spatial:.2f} Pixels")
@@ -284,11 +260,11 @@ def evaluate_statera():
     print(f" 3. Magnitude Delta (Pred - True) : {mean_mag_delta:+.2f} px")
     print(f" 4. Phase Angle Error (Pred VS True): {mean_angle:.1f}°")
 
-    # W&B Logging
     wandb.log({
         "eval/traj_spatial_err_px": mean_traj_spatial,
         "eval/traj_depth_err_m": mean_traj_depth,
         "eval/traj_mag_err_cm": mean_traj_mag,
+        "eval/kinematic_jitter_px_f2": mean_kinematic_jitter,
         "eval/term_spatial_err_px": mean_term_spatial,
         "eval/term_max_spatial_px": max_term_spatial,
         "eval/term_depth_err_m": mean_term_depth,
@@ -321,7 +297,6 @@ def evaluate_statera():
 
     print("\n" + "=" * 60 + "\n")
 
-    # Safely close W&B run
     wandb.finish()
 
 
