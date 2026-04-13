@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument('--finetune_blocks', type=int, default=0)
     parser.add_argument('--wandb_name', type=str, required=True)
 
-    parser.add_argument('--epochs', type=int, default=35)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--metrics_file', type=str, default='run_metrics.json')
 
     return parser.parse_args()

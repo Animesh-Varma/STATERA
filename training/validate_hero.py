@@ -59,7 +59,7 @@ if __name__ == "__main__":
             all_passed = False
 
     if all_passed:
-        print("\nALL HERO PIPELINES VERIFIED. Clear for 50-Epoch Runs.")
+        print("\nALL HERO PIPELINES VERIFIED. Clear for 30-Epoch Runs.")
     else:
         print("\nVALIDATION FAILED.")
 
