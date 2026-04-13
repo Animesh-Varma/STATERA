@@ -32,8 +32,6 @@ def parse_args():
     parser.add_argument('--wandb_name', type=str, required=True)
     parser.add_argument('--epochs', type=int, default=35)
     parser.add_argument('--metrics_file', type=str, default='run_metrics.json')
-
-    # CHANGE 1: Add accumulation argument
     parser.add_argument('--accumulate_steps', type=int, default=1)
 
     return parser.parse_args()
@@ -58,7 +56,6 @@ def focal_loss_bce(logits, targets, alpha=0.25, gamma=2.0):
     return focal_loss.mean()
 
 
-# CHANGE 2: Update definition to accept all 5 metrics
 def save_metrics(run_name, h_loss, z_loss, pixel_err, p95_err, jitter_err, metrics_file):
     data = {}
     if os.path.exists(metrics_file):
@@ -128,7 +125,7 @@ def main():
                 train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
 
             model.train()
-            optimizer.zero_grad(set_to_none=True)  # CHANGE 3: zero_grad outside inner loop
+            optimizer.zero_grad(set_to_none=True)
             run_h, run_z = 0.0, 0.0
 
             for i, (vids, gt_h, gt_z, gt_coords) in enumerate(train_loader):
@@ -148,11 +145,9 @@ def main():
                             pred_h[:, f], gt_h[:, f])) * w
                     if not args.single_task: w_z += criterion_z(pred_z[:, f], gt_z[:, f]) * w
 
-                # CHANGE 4: Scale loss by accumulation steps
                 loss = (w_h + (0.1 * w_z if not args.single_task else 0.0)) / args.accumulate_steps
                 loss.backward()
 
-                # CHANGE 5: Step only after N accumulation steps
                 if (i + 1) % args.accumulate_steps == 0 or (i + 1) == len(train_loader):
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -160,6 +155,7 @@ def main():
                 run_h += w_h.item() if isinstance(w_h, torch.Tensor) else float(w_h)
                 run_z += w_z.item() if isinstance(w_z, torch.Tensor) else float(w_z)
 
+            # Validation
             model.eval()
             val_h, val_z, total_px_err, total_jitter_err = 0.0, 0.0, 0.0, 0.0
             all_batch_errors = []
@@ -191,6 +187,9 @@ def main():
             avg_px_err, avg_jitter = (total_px_err / len(val_loader)) * scale, (
                         total_jitter_err / len(val_loader)) * scale
             p95_px_err = torch.quantile(torch.cat(all_batch_errors, dim=0).float(), 0.95).item() * scale
+
+            train_h_losses.append(run_h / len(train_loader))
+            val_h_losses.append(avg_val_h)
 
             log(f"Epoch [{epoch + 1}/{args.epochs}] | Val Loss: {avg_val_h:.4f} | PX Err: {avg_px_err:.2f} px | P95 Err: {p95_px_err:.2f} px | Jitter: {avg_jitter:.4f}")
             wandb.log({"val/heatmap_loss": avg_val_h, "val/z_loss": avg_val_z, "metrics/pixel_error": avg_px_err,
