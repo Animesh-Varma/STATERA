@@ -137,28 +137,14 @@ def main():
         curriculum_patience_counter = 0
 
         for epoch in range(args.epochs):
+            funnel_ratio = min(1.0, epoch / 15.0)
+
             if not args.static_sigma:
-                current_sigma = max(3.0, 12.5 - (9.5) * (epoch / 25.0))
+                current_sigma = max(3.0, 12.5 - (9.5 * funnel_ratio))
                 train_ds.dataset.update_sigma(current_sigma)
 
-            # TARGET ROUTING LOGIC
-            if args.target_type == 'twostage':
-                if epoch < 25:
-                    train_ds.dataset.target_type = 'crescent'
-                    train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
-                else:
-                    train_ds.dataset.target_type = 'dot'
-
-            elif args.target_type == 'dynamic_twostage':
-                if curriculum_stage == 'crescent':
-                    train_ds.dataset.target_type = 'crescent'
-                    current_alpha = min(1.0, epoch / 5.0)
-                    train_ds.dataset.update_phase_alpha(current_alpha)
-                else:
-                    train_ds.dataset.target_type = 'dot'
-
-            elif args.target_type in ['blend', 'crescent']:
-                train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
+            if args.target_type in ['crescent', 'blend']:
+                train_ds.dataset.update_phase_alpha(funnel_ratio)
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
