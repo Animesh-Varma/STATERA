@@ -20,7 +20,8 @@ def parse_args():
     parser.add_argument('--dataset_path', type=str, default='../sim/statera_poc.hdf5')
     parser.add_argument('--decoder_type', type=str, default='mlp', choices=['mlp', 'deconv', 'regression'])
     parser.add_argument('--temporal_mixer', type=str, default='conv1d', choices=['conv1d', 'transformer', 'none'])
-    parser.add_argument('--target_type', type=str, default='dot', choices=['dot', 'blend', 'crescent', 'twostage'])
+    parser.add_argument('--target_type', type=str, default='dot',
+                        choices=['dot', 'blend', 'crescent', 'twostage', 'dynamic_twostage'])
     parser.add_argument('--backbone', type=str, default='vjepa', choices=['vjepa', 'dinov2'])
     parser.add_argument('--temporal_weighting', type=str, default='exponential', choices=['exponential', 'uniform'])
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'])
@@ -35,9 +36,12 @@ def parse_args():
     parser.add_argument('--accumulate_steps', type=int, default=1)
     parser.add_argument('--metrics_file', type=str, default='run_metrics.json')
 
-    # Vanguard Checkpoint Arguments
     parser.add_argument('--save_checkpoint_every_epoch', action='store_true')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
+
+    # Curriculum Scheduler Args
+    parser.add_argument('--curriculum_patience', type=int, default=2)
+    parser.add_argument('--curriculum_delta', type=float, default=0.01)
 
     return parser.parse_args()
 
@@ -90,7 +94,7 @@ def main():
     log(f"[*] Initialized {args.wandb_name} on {device}")
 
     try:
-        init_target = 'crescent' if args.target_type == 'twostage' else args.target_type
+        init_target = 'crescent' if args.target_type in ['twostage', 'dynamic_twostage'] else args.target_type
         start_sigma = 3.0 if args.static_sigma else 12.5
 
         dataset = StateraDataset(args.dataset_path, target_type=init_target, start_sigma=start_sigma,
@@ -123,19 +127,30 @@ def main():
 
         train_h_losses, val_h_losses = [], []
 
-        # Create checkpoint directory if needed
         if args.save_checkpoint_every_epoch:
             os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+        # Dynamic Curriculum Variables
+        curriculum_stage = 'crescent'
+        best_curriculum_loss = float('inf')
+        curriculum_patience_counter = 0
 
         for epoch in range(args.epochs):
             if not args.static_sigma:
                 current_sigma = max(3.0, 12.5 - (9.5) * (epoch / 25.0))
                 train_ds.dataset.update_sigma(current_sigma)
 
+            # TARGET ROUTING
             if args.target_type == 'twostage':
                 if epoch < 25:
                     train_ds.dataset.target_type = 'crescent'
                     train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
+                else:
+                    train_ds.dataset.target_type = 'dot'
+            elif args.target_type == 'dynamic_twostage':
+                if curriculum_stage == 'crescent':
+                    train_ds.dataset.target_type = 'crescent'
+                    train_ds.dataset.update_phase_alpha(1.0)  # Solid Crescent
                 else:
                     train_ds.dataset.target_type = 'dot'
             elif args.target_type in ['blend', 'crescent']:
@@ -236,8 +251,7 @@ def main():
             train_h_losses.append(run_h / len(train_loader))
             val_h_losses.append(avg_val_h)
 
-            log(f"Epoch [{epoch + 1}/{args.epochs}] | Val Loss: {avg_val_h:.4f} | PX Err: {avg_px_err:.2f} px | P95 Err: {p95_px_err:.2f} px | Jitter: {avg_jitter:.4f}")
-
+            log(f"Epoch [{epoch + 1}/{args.epochs}] | Target: {train_ds.dataset.target_type.upper()} | Val Loss: {avg_val_h:.4f} | PX Err: {avg_px_err:.2f} px | P95 Err: {p95_px_err:.2f} px | Jitter: {avg_jitter:.4f}")
             wandb.log({
                 "val/heatmap_loss": avg_val_h,
                 "val/z_loss": avg_val_z,
@@ -246,7 +260,19 @@ def main():
                 "metrics/kinematic_jitter": avg_jitter
             })
 
-            # SAVE CHECKPOINT LOGIC
+            # DYNAMIC CURRICULUM PLATEAU CHECK
+            if args.target_type == 'dynamic_twostage' and curriculum_stage == 'crescent':
+                if avg_val_h < (best_curriculum_loss - args.curriculum_delta):
+                    best_curriculum_loss = avg_val_h
+                    curriculum_patience_counter = 0
+                else:
+                    curriculum_patience_counter += 1
+                    log(f"[*] Curriculum Patience: {curriculum_patience_counter}/{args.curriculum_patience}")
+
+                if curriculum_patience_counter >= args.curriculum_patience:
+                    log("\n[>>] CURRICULUM PHASE SHIFT TRIGGERED: Plateau detected. Switching target to DOT.\n")
+                    curriculum_stage = 'dot'
+
             if args.save_checkpoint_every_epoch:
                 ckpt_path = os.path.join(args.checkpoint_dir, f"{args.wandb_name}_epoch_{epoch + 1}.pth")
                 torch.save(model.state_dict(), ckpt_path)
