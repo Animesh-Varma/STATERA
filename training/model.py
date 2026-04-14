@@ -46,6 +46,10 @@ class StateraModel(nn.Module):
         elif self.temporal_mixer == 'transformer':
             layer = nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=8, batch_first=True)
             self.temp_net = nn.TransformerEncoder(layer, num_layers=2)
+            # FIXED: Added required Positional Embeddings for the temporal transformer mixer
+            self.pos_embed = nn.Parameter(torch.zeros(1, 16, self.embed_dim))
+            nn.init.normal_(self.pos_embed, std=0.02)
+
         elif self.temporal_mixer == 'none':
             self.temp_net = nn.Identity()
 
@@ -89,13 +93,18 @@ class StateraModel(nn.Module):
             T_current = 8
 
         elif self.backbone_type == 'dinov2':
-            x = F.interpolate(x.reshape(B * 16, 3, 384, 384), size=392, mode='bilinear')
+            if len(x.shape) == 5 and x.shape[1] == 3 and x.shape[2] == 16:
+                x_inter = x.permute(0, 2, 1, 3, 4).reshape(B * 16, 3, 384, 384)
+            else:
+                x_inter = x.reshape(B * 16, 3, 384, 384)
+
+            x_inter = F.interpolate(x_inter, size=392, mode='bilinear')
             tokens_list = []
             chunk_size = 16
 
             with torch.set_grad_enabled(enable_grad):
                 for i in range(0, B * 16, chunk_size):
-                    chunk = x[i:i + chunk_size]
+                    chunk = x_inter[i:i + chunk_size]
                     out = self.backbone.forward_features(chunk)['x_norm_patchtokens']
                     tokens_list.append(out)
 
@@ -116,26 +125,28 @@ class StateraModel(nn.Module):
                 if self.temporal_mixer == 'conv1d':
                     feat = self.temp_net(feat.transpose(1, 2)).transpose(1, 2)
                 elif self.temporal_mixer == 'transformer':
+                    feat = feat + self.pos_embed[:, :feat.size(1), :]  # Add pos embed
                     feat = self.temp_net(feat)
             else:
-                B, T, P, C = feat.shape
+                B_curr, T_curr, P_curr, C_curr = feat.shape
                 if self.temporal_mixer == 'conv1d':
-                    feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C).permute(0, 2, 1)
+                    feat_flat = feat.permute(0, 2, 1, 3).reshape(B_curr * P_curr, T_curr, C_curr).permute(0, 2, 1)
                     feat_flat = self.temp_net(feat_flat)
-                    feat = feat_flat.permute(0, 2, 1).reshape(B, P, T, C).permute(0, 2, 1, 3)
+                    feat = feat_flat.permute(0, 2, 1).reshape(B_curr, P_curr, T_curr, C_curr).permute(0, 2, 1, 3)
                 elif self.temporal_mixer == 'transformer':
-                    feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C)
+                    feat_flat = feat.permute(0, 2, 1, 3).reshape(B_curr * P_curr, T_curr, C_curr)
+                    feat_flat = feat_flat + self.pos_embed[:, :T_curr, :]  # Add pos embed
                     feat_flat = self.temp_net(feat_flat)
-                    feat = feat_flat.reshape(B, P, T, C).permute(0, 2, 1, 3)
+                    feat = feat_flat.reshape(B_curr, P_curr, T_curr, C_curr).permute(0, 2, 1, 3)
 
         if T_current == 8:
             if self.decoder_type in ['mlp', 'regression']:
                 feat = F.interpolate(feat.transpose(1, 2), size=16, mode='linear').transpose(1, 2)
             else:
-                B, T, P, C = feat.shape
-                feat_flat = feat.permute(0, 2, 1, 3).reshape(B * P, T, C).permute(0, 2, 1)
+                B_curr, T_curr, P_curr, C_curr = feat.shape
+                feat_flat = feat.permute(0, 2, 1, 3).reshape(B_curr * P_curr, T_curr, C_curr).permute(0, 2, 1)
                 feat_flat = F.interpolate(feat_flat, size=16, mode='linear')
-                feat = feat_flat.permute(0, 2, 1).reshape(B, P, 16, C).permute(0, 2, 1, 3)
+                feat = feat_flat.permute(0, 2, 1).reshape(B_curr, P_curr, 16, C_curr).permute(0, 2, 1, 3)
 
         out = None
         if self.decoder_type == 'mlp':

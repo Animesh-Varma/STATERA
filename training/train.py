@@ -1,5 +1,4 @@
 import os
-import time
 import json
 import torch
 import torch.nn as nn
@@ -122,6 +121,8 @@ def main():
         ).to(device)
 
         optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+
         criterion_h = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
         criterion_z = nn.HuberLoss()
 
@@ -140,19 +141,22 @@ def main():
                 current_sigma = max(3.0, 12.5 - (9.5) * (epoch / 25.0))
                 train_ds.dataset.update_sigma(current_sigma)
 
-            # TARGET ROUTING
+            # TARGET ROUTING LOGIC
             if args.target_type == 'twostage':
                 if epoch < 25:
                     train_ds.dataset.target_type = 'crescent'
                     train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
                 else:
                     train_ds.dataset.target_type = 'dot'
+
             elif args.target_type == 'dynamic_twostage':
                 if curriculum_stage == 'crescent':
                     train_ds.dataset.target_type = 'crescent'
-                    train_ds.dataset.update_phase_alpha(1.0)  # Solid Crescent
+                    current_alpha = min(1.0, epoch / 5.0)
+                    train_ds.dataset.update_phase_alpha(current_alpha)
                 else:
                     train_ds.dataset.target_type = 'dot'
+
             elif args.target_type in ['blend', 'crescent']:
                 train_ds.dataset.update_phase_alpha(min(1.0, epoch / 25.0))
 
@@ -192,11 +196,16 @@ def main():
                 loss.backward()
 
                 if (i + 1) % args.accumulate_steps == 0 or (i + 1) == len(train_loader):
+                    # Added Gradient Clipping to prevent explosion when backbone is unfrozen
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
                 run_h += w_h.item() if isinstance(w_h, torch.Tensor) else float(w_h)
                 run_z += w_z.item() if isinstance(w_z, torch.Tensor) else float(w_z)
+
+            # Step the LR scheduler
+            scheduler.step()
 
             # Validation
             model.eval()
@@ -251,27 +260,32 @@ def main():
             train_h_losses.append(run_h / len(train_loader))
             val_h_losses.append(avg_val_h)
 
-            log(f"Epoch [{epoch + 1}/{args.epochs}] | Target: {train_ds.dataset.target_type.upper()} | Val Loss: {avg_val_h:.4f} | PX Err: {avg_px_err:.2f} px | P95 Err: {p95_px_err:.2f} px | Jitter: {avg_jitter:.4f}")
+            log(f"Epoch[{epoch + 1}/{args.epochs}] | Target: {train_ds.dataset.target_type.upper()} | Val Loss: {avg_val_h:.4f} | PX Err: {avg_px_err:.2f} px | P95 Err: {p95_px_err:.2f} px | Jitter: {avg_jitter:.4f}")
             wandb.log({
                 "val/heatmap_loss": avg_val_h,
                 "val/z_loss": avg_val_z,
                 "metrics/pixel_error": avg_px_err,
                 "metrics/p95_error": p95_px_err,
-                "metrics/kinematic_jitter": avg_jitter
+                "metrics/kinematic_jitter": avg_jitter,
+                "learning_rate": optimizer.param_groups[0]['lr']
             })
 
-            # DYNAMIC CURRICULUM PLATEAU CHECK
+            # DYNAMIC CURRICULUM PLATEAU CHECK (Premature Plateau Bug Eliminated)
             if args.target_type == 'dynamic_twostage' and curriculum_stage == 'crescent':
-                if avg_val_h < (best_curriculum_loss - args.curriculum_delta):
-                    best_curriculum_loss = avg_val_h
-                    curriculum_patience_counter = 0
-                else:
-                    curriculum_patience_counter += 1
-                    log(f"[*] Curriculum Patience: {curriculum_patience_counter}/{args.curriculum_patience}")
+                safe_alpha = min(1.0, epoch / 5.0)
 
-                if curriculum_patience_counter >= args.curriculum_patience:
-                    log("\n[>>] CURRICULUM PHASE SHIFT TRIGGERED: Plateau detected. Switching target to DOT.\n")
-                    curriculum_stage = 'dot'
+                # Only monitor plateau if the Crescent is fully formed
+                if safe_alpha >= 1.0:
+                    if avg_val_h < (best_curriculum_loss - args.curriculum_delta):
+                        best_curriculum_loss = avg_val_h
+                        curriculum_patience_counter = 0
+                    else:
+                        curriculum_patience_counter += 1
+                        log(f"[*] Curriculum Patience: {curriculum_patience_counter}/{args.curriculum_patience}")
+
+                    if curriculum_patience_counter >= args.curriculum_patience:
+                        log("\n[>>] CURRICULUM PHASE SHIFT TRIGGERED: Plateau detected. Switching target to DOT.\n")
+                        curriculum_stage = 'dot'
 
             if args.save_checkpoint_every_epoch:
                 ckpt_path = os.path.join(args.checkpoint_dir, f"{args.wandb_name}_epoch_{epoch + 1}.pth")
