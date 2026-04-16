@@ -53,11 +53,15 @@ def get_var(key, prompt_msg, cast_type, default):
     return config[key]
 
 
-def get_subpixel_coords(logits_heatmap, device):
-    """Calculates expected-value float coordinates from the raw 64x64 sequence logits."""
+def get_subpixel_coords(logits_heatmap, device, temperature=2.0):
+    """
+    *UPDATED*: Temperature-Scaled Spatial Softmax.
+    Eliminates the 6-pixel quantization staircase by softly bleeding
+    the one-hot peak into neighboring pixels, restoring true sub-pixel interpolation.
+    """
     B, T, H, W = logits_heatmap.shape
-    probs = torch.sigmoid(logits_heatmap).view(B * T, -1)
-    probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
+    # Apply Temperature Softmax instead of Sigmoid + Sum Division
+    probs = torch.nn.functional.softmax((logits_heatmap.view(B * T, -1)) / temperature, dim=1)
     probs = probs.view(B, T, H, W)
 
     y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
@@ -65,7 +69,6 @@ def get_subpixel_coords(logits_heatmap, device):
     x_center = (probs * x_grid.float().view(1, 1, H, W)).sum(dim=(2, 3))
 
     return torch.stack([x_center, y_center], dim=2)
-
 
 def evaluate_statera():
     print("=" * 60)
@@ -84,13 +87,21 @@ def evaluate_statera():
         print("\n[!] ERROR: camera_matrix.npy or dist_coeffs.npy missing.")
         return
 
-    model_path = os.path.join(training_dir, "best_statera_probe.pth")
+    model_path = os.path.join(training_dir, "Vanguard-5K-Hero-V3_epoch_30.pth")
     if not os.path.exists(model_path):
         print(f"\n[!] ERROR: Missing '{model_path}'.")
         return
 
-    model = StateraModel(heatmap_res=64).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True), strict=False)
+    model = StateraModel(
+        decoder_type='deconv',
+        temporal_mixer='conv1d',
+        single_task=False,
+        backbone_type='vjepa',
+        finetune_blocks=2
+    ).to(device)
+
+    print(f"[INFO] Loading weights from {model_path}...")
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True), strict=True)
     model.eval()
 
     target_dir = get_var('output_dir', 'Path to directory containing output videos and JSONs', str, 'output')
@@ -104,7 +115,7 @@ def evaluate_statera():
 
     traj_spatial_errors, traj_depth_errors, traj_mag_errors = [], [], []
     term_spatial_errors, term_depth_errors, term_mag_errors = [], [], []
-    kinematic_jitter_errors = [] # NEW: Tracks Acceleration Deviation
+    kinematic_jitter_errors = [] # Tracks Acceleration Deviation
 
     term_mags_true, term_mags_pred = [], []
     term_mag_deltas, term_angles = [], []
@@ -146,6 +157,7 @@ def evaluate_statera():
             seq_spatial_err = 0.0
             seq_depth_err = 0.0
             seq_mag_err_px = 0.0
+            seq_pred_depth = 0.0 # NEW: Tracks the sum of predicted depth for averaging
 
             true_traj = []
             pred_traj = []
@@ -185,6 +197,7 @@ def evaluate_statera():
                 seq_spatial_err += l2_dist
                 seq_depth_err += abs_z_err
                 seq_mag_err_px += abs_m_err_px
+                seq_pred_depth += pred_z_val # Accumulate predicted depth
 
                 if frame_idx == 15:
                     term_spatial_errors.append(l2_dist)
@@ -203,7 +216,7 @@ def evaluate_statera():
                     term_mag_deltas.append(mag_pred_px - mag_true_px)
                     term_angles.append(angle_deg)
 
-            # NEW: Kinematic Jitter (2nd Derivative Acceleration Deviation)
+            # Kinematic Jitter (2nd Derivative Acceleration Deviation)
             true_pts = np.array(true_traj)
             pred_pts = np.array(pred_traj)
 
@@ -217,9 +230,10 @@ def evaluate_statera():
 
             avg_seq_spatial = seq_spatial_err / 16.0
             avg_seq_mag_px = seq_mag_err_px / 16.0
+            avg_pred_depth = seq_pred_depth / 16.0 # Calculate average predicted depth for the sequence
             valid_count += 1
 
-            print(f"   -> [Seq {valid_count:03d}] UV: {avg_seq_spatial:5.2f}px | Mag: {avg_seq_mag_px:5.1f}px | Ang: {term_angles[-1]:5.1f}° | Jitter: {seq_jitter_err:5.2f} px/f²")
+            print(f"   -> [Seq {valid_count:03d}] UV: {avg_seq_spatial:5.2f}px | Mag: {avg_seq_mag_px:5.1f}px | Ang: {term_angles[-1]:5.1f}° | Jitter: {seq_jitter_err:5.2f} px/f² | Est. Depth: {avg_pred_depth:5.3f}m")
 
         if valid_count == 0: return
 

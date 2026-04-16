@@ -13,15 +13,15 @@ class StateraDataset(Dataset):
         self.target_type = target_type
         self.jitter_box = jitter_box
 
-        print(f"Loading dataset into RAM...")
-        with h5py.File(self.h5_path, 'r') as f:
-            self.videos = f['videos'][:]
-            self.uv_coords = f['uv_coords'][:]
-            self.z_depths = f['z_depths'][:]
-            self.box_center_uv = f['box_center_uv'][:]
-        print("✓ Dataset successfully cached in RAM!")
+        # Initialize as None. The PyTorch DataLoader workers will open this dynamically.
+        self.h5_file = None
 
-        self.length = len(self.videos)
+        print(f"[*] Probing dataset length from disk (Lazy Loading)...")
+        # Open temporarily just to get the length, then immediately close it.
+        with h5py.File(self.h5_path, 'r') as f:
+            self.length = len(f['videos'])
+        print(f"[✓] Dataset linked. Total sequences streaming from SSD: {self.length}")
+
         y, x = torch.meshgrid(
             torch.arange(self.heatmap_res, dtype=torch.float32),
             torch.arange(self.heatmap_res, dtype=torch.float32),
@@ -40,21 +40,27 @@ class StateraDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        video = torch.from_numpy(self.videos[idx]).float() / 255.0
-        video = video.permute(1, 0, 2, 3)
+        # LAZY LOAD: Open the HDF5 file per-worker to prevent Multiprocessing crashes
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.h5_path, 'r')
 
-        uv_np = self.uv_coords[idx].reshape(16, 2)
-        box_np = self.box_center_uv[idx].reshape(16, 2)
+        # Stream ONLY the specific index needed for this batch
+        video_np = self.h5_file['videos'][idx]
+        uv_np = self.h5_file['uv_coords'][idx].reshape(16, 2)
+        box_np = self.h5_file['box_center_uv'][idx].reshape(16, 2)
+        z_depth_np = self.h5_file['z_depths'][idx]
+
+        video = torch.from_numpy(video_np).float() / 255.0
+        video = video.permute(1, 0, 2, 3)
 
         if self.jitter_box:
             noise = np.random.uniform(-5.0, 5.0, size=box_np.shape)
             box_np = box_np + noise
 
-        z_depth = torch.tensor(self.z_depths[idx].flatten(), dtype=torch.float32).view(16, 1)
+        z_depth = torch.tensor(z_depth_np.flatten(), dtype=torch.float32).view(16, 1)
 
         scale = self.heatmap_res / 384.0
 
-        # EXTRACT TRUE UV COORDS AT 64x64 SCALE FOR PRECISE PIXEL ERROR
         true_uv = torch.stack([
             torch.tensor(uv_np[:, 0] * scale, dtype=torch.float32),
             torch.tensor(uv_np[:, 1] * scale, dtype=torch.float32)

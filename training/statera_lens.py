@@ -3,6 +3,7 @@ import base64
 import tempfile
 import math
 import torch
+import torch.nn.functional as F
 import h5py
 import numpy as np
 import cv2
@@ -10,7 +11,6 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
 
 # Import your model architecture
 from model import StateraModel
@@ -25,15 +25,26 @@ global_dataset = None
 
 def load_ml_state():
     global model, global_dataset
-    model_path = "best_statera_probe.pth"
+
+    # You can change this to epoch_18.pth if you want the absolute lowest jitter
+    model_path = "Vanguard-5K-Hero-V3_epoch_30.pth"
     hdf5_path = "../sim/statera_poc.hdf5"
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Missing {model_path}. Run train.py first.")
 
     print("Loading STATERA Model...")
-    model = StateraModel(heatmap_res=64).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True), strict=False)
+    # FIXED: Initialized with exact Vanguard V3 Architecture
+    model = StateraModel(
+        decoder_type='deconv',
+        temporal_mixer='conv1d',
+        single_task=False,
+        backbone_type='vjepa',
+        finetune_blocks=2
+    ).to(device)
+
+    # FIXED: Enforced strict=True to guarantee weights match
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True), strict=True)
     model.eval()
     print("✅ Inference Engine Ready.")
 
@@ -50,11 +61,13 @@ def load_ml_state():
         print(f"⚠️ HDF5 dataset not found at {hdf5_path}.")
 
 
-def get_subpixel_coords(logits_heatmap):
-    """Updated to handle 4D temporal sequences [B, T, H, W]"""
+def get_subpixel_coords(logits_heatmap, temperature=2.0):
+    """
+    FIXED: Temperature-Scaled Spatial Softmax.
+    Eliminates the 6-pixel quantization staircase.
+    """
     B, T, H, W = logits_heatmap.shape
-    probs = torch.sigmoid(logits_heatmap).view(B * T, -1)
-    probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
+    probs = F.softmax((logits_heatmap.view(B * T, -1)) / temperature, dim=1)
     probs = probs.view(B, T, H, W)
 
     y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
@@ -106,58 +119,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="STATERA Web Engine", lifespan=lifespan)
-
-
-class ManualEvalRequest(BaseModel):
-    video_name: str
-    pred_u: float
-    pred_v: float
-    center_u: float
-    center_v: float
-    true_u: float
-    true_v: float
-
-
-@app.post("/api/evaluate_manual")
-async def evaluate_manual(data: ManualEvalRequest):
-    # 1. Spatial Error
-    spatial_err = math.sqrt((data.pred_u - data.true_u) ** 2 + (data.pred_v - data.true_v) ** 2)
-
-    # 2. Define 2D Vectors (Origin is user-clicked Geometric Center)
-    v_true = np.array([data.true_u - data.center_u, data.true_v - data.center_v])
-    v_pred = np.array([data.pred_u - data.center_u, data.pred_v - data.center_v])
-
-    # 3. Magnitudes
-    mag_true = np.linalg.norm(v_true)
-    mag_pred = np.linalg.norm(v_pred)
-    mag_delta = mag_pred - mag_true
-
-    # 4. Phase Angle via Cosine Similarity
-    if mag_true > 1e-5 and mag_pred > 1e-5:
-        cos_theta = np.dot(v_true, v_pred) / (mag_true * mag_pred)
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-        angle_deg = math.degrees(math.acos(cos_theta))
-    else:
-        angle_deg = 0.0
-
-    # Print Formatted Report to Terminal
-    print(f"\n" + "=" * 60)
-    print(f" GOLD STANDARD MANUAL EVALUATION: {data.video_name}")
-    print(f"=" * 60)
-    print(f" --- TERMINAL PERFORMANCE (Frame 16) ---")
-    print(f" Terminal Spatial Error        : {spatial_err:.2f} Pixels")
-    print(f" Terminal Amplitude Error (Abs): {abs(mag_delta):.2f} Pixels")
-
-    print(f"\n" + "-" * 60)
-    print(f" 2D VECTOR ANALYSIS")
-    print(f"-" * 60)
-    print(f" 1. Magnitude True (Amplitude)    : {mag_true:.2f} px")
-    print(f" 2. Magnitude Pred (Amplitude)    : {mag_pred:.2f} px")
-    print(f" 3. Magnitude Delta (Pred - True) : {mag_delta:+.2f} px")
-    print(f" 4. Phase Angle Error (Pred VS True): {angle_deg:.1f}°")
-    print(f"=" * 60 + "\n")
-
-    return {"status": "success", "message": "Logged to terminal!"}
 
 
 @app.get("/api/auditor/infer/{ep_idx}")
@@ -293,8 +254,6 @@ async def zero_shot_inference(
         "pred_z": f"{final_pred_z:.4f} m",
         "gt_uv": "N/A",
         "pred_uv": f"{final_pred_u:.1f}, {final_pred_v:.1f}",
-        "raw_pred_u": float(final_pred_u),
-        "raw_pred_v": float(final_pred_v),
         "error_px": "N/A",
         "frames": frames_to_base64(out_frames)
     })
@@ -429,13 +388,6 @@ HTML_CONTENT = """
                             <input type="range" id="batchSlider" class="m3-slider" min="0" max="0" value="0">
                         </div>
                     </div>
-
-                    <!-- NEW: Manual Annotation Button -->
-                    <button id="btnAnnotateTruth" class="hidden w-full mt-4 py-3 rounded-full border border-m3-primary text-m3-primary font-medium text-sm flex items-center justify-center gap-2 hover:bg-m3-primary/10 transition shadow-md">
-                        <span class="material-symbols-rounded text-[20px]">target</span>
-                        Annotate Ground Truth
-                    </button>
-
                 </div>
             </div>
 
@@ -485,12 +437,6 @@ HTML_CONTENT = """
 
         <!-- RIGHT PANEL / OUTPUT STAGE -->
         <div class="bg-m3-surface rounded-[24px] p-6 flex-1 flex flex-col items-center justify-center min-h-[500px] relative border border-white/5 shadow-lg overflow-hidden">
-
-            <!-- ANNOTATION INSTRUCTION BANNER -->
-            <div id="annotationBanner" class="hidden absolute top-6 bg-black/80 backdrop-blur-md border border-m3-primary text-white px-6 py-3 rounded-full z-30 flex items-center justify-center gap-3 shadow-xl">
-                <span class="material-symbols-rounded text-m3-primary animate-pulse">touch_app</span>
-                <span id="annotationText" class="text-sm font-medium tracking-wide">Step 1: Click the Geometric Center of the Box</span>
-            </div>
 
             <div id="loader" class="hidden absolute inset-0 bg-m3-bg/80 backdrop-blur-sm z-20 flex flex-col items-center justify-center">
                 <div class="w-12 h-12 border-4 border-m3-surfaceHigh border-t-m3-primary rounded-full animate-spin mb-4"></div>
@@ -587,14 +533,12 @@ HTML_CONTENT = """
         const tabZeroShot = document.getElementById('tabZeroShot');
         const viewAuditor = document.getElementById('viewAuditor');
         const viewZeroShot = document.getElementById('viewZeroShot');
-        const btnAnnotateTruth = document.getElementById('btnAnnotateTruth');
 
         tabAuditor.onclick = () => { 
             currentMode='auditor'; 
             tabAuditor.className = "flex-1 py-2 text-sm font-medium rounded-full bg-m3-secondaryContainer text-m3-onSecondaryContainer transition-all z-10 shadow-sm";
             tabZeroShot.className = "flex-1 py-2 text-sm font-medium rounded-full text-m3-textVariant hover:text-m3-text transition-all z-10";
             viewAuditor.classList.remove('hidden'); viewZeroShot.classList.add('hidden'); resetOutput(); 
-            btnAnnotateTruth.classList.add('hidden');
         };
         tabZeroShot.onclick = () => { 
             currentMode='zeroshot'; 
@@ -603,7 +547,6 @@ HTML_CONTENT = """
             viewZeroShot.classList.remove('hidden'); viewAuditor.classList.add('hidden'); resetOutput(); 
             if (batchResults.length > 0) {
                 loadBatchResult(currentBatchIdx);
-                btnAnnotateTruth.classList.remove('hidden');
             }
         };
 
@@ -626,7 +569,6 @@ HTML_CONTENT = """
             document.getElementById('statsPanel').classList.add('hidden');
             document.getElementById('statsPanel').classList.remove('flex');
             document.getElementById('emptyState').classList.remove('hidden');
-            cancelAnnotation(); // Reset state
         }
 
         function renderFrame(idx) {
@@ -639,7 +581,6 @@ HTML_CONTENT = """
 
         function startSequence() {
             if(!currentFrames.length) return;
-            cancelAnnotation(); // Stop annotating if they play video
             isPlaying = true;
             document.getElementById('iconPlay').classList.add('hidden'); 
             document.getElementById('iconPause').classList.remove('hidden');
@@ -908,7 +849,6 @@ HTML_CONTENT = """
             }
 
             initSequence(data.frames);
-            btnAnnotateTruth.classList.remove('hidden');
         }
 
         document.getElementById('batchSlider').addEventListener('input', (e) => {
@@ -971,74 +911,6 @@ HTML_CONTENT = """
                 document.getElementById('emptyState').classList.remove('hidden');
             }
         }
-
-        // ==========================================
-        // MANUAL ANNOTATION LOGIC
-        // ==========================================
-        let annotationStep = 0;
-        let manualCenter = null;
-        let manualTrue = null;
-        const annotationBanner = document.getElementById('annotationBanner');
-        const annotationText = document.getElementById('annotationText');
-
-        function cancelAnnotation() {
-            annotationStep = 0;
-            annotationBanner.classList.add('hidden');
-            resultCanvas.style.cursor = 'default';
-        }
-
-        btnAnnotateTruth.onclick = () => {
-            stopSequence();
-            renderFrame(15); // Jump to final frame
-            annotationStep = 1;
-            annotationText.innerText = "Step 1: Click the Geometric Center of the box";
-            annotationBanner.classList.remove('hidden');
-            resultCanvas.style.cursor = 'crosshair';
-        };
-
-        resultCanvas.onclick = async (e) => {
-            if (annotationStep === 0) return;
-
-            const rect = resultCanvas.getBoundingClientRect();
-            // Scale click coordinates from the DOM size to the actual 384x384 tensor size
-            const scaleX = 384.0 / rect.width;
-            const scaleY = 384.0 / rect.height;
-
-            const clickX = (e.clientX - rect.left) * scaleX;
-            const clickY = (e.clientY - rect.top) * scaleY;
-
-            if (annotationStep === 1) {
-                manualCenter = { x: clickX, y: clickY };
-                annotationStep = 2;
-                annotationText.innerText = "Step 2: Click the true Center of Mass (Weight)";
-            } else if (annotationStep === 2) {
-                manualTrue = { x: clickX, y: clickY };
-                cancelAnnotation();
-
-                const currentData = batchResults[currentBatchIdx];
-                const payload = {
-                    video_name: currentData.ep_idx,
-                    pred_u: currentData.raw_pred_u,
-                    pred_v: currentData.raw_pred_v,
-                    center_u: manualCenter.x,
-                    center_v: manualCenter.y,
-                    true_u: manualTrue.x,
-                    true_v: manualTrue.y
-                };
-
-                try {
-                    const res = await fetch('/api/evaluate_manual', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    const resData = await res.json();
-                    alert("✅ Benchmark complete! Check your Python terminal for the final physics report.");
-                } catch (err) {
-                    alert("Failed to submit annotation.");
-                }
-            }
-        };
     </script>
 </body>
 </html>

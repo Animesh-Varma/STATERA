@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import wandb
 import argparse
 import traceback
+import copy
 
 from dataset import StateraDataset
 from model import StateraModel
@@ -16,7 +17,7 @@ from model import StateraModel
 
 def parse_args():
     parser = argparse.ArgumentParser(description="STATERA Training Pipeline")
-    parser.add_argument('--dataset_path', type=str, default='../sim/statera_poc.hdf5')
+    parser.add_argument('--dataset_path', type=str, default='../sim/statera_50k.hdf5')
     parser.add_argument('--decoder_type', type=str, default='mlp', choices=['mlp', 'deconv', 'regression'])
     parser.add_argument('--temporal_mixer', type=str, default='conv1d', choices=['conv1d', 'transformer', 'none'])
     parser.add_argument('--target_type', type=str, default='dot',
@@ -31,7 +32,7 @@ def parse_args():
     parser.add_argument('--jitter_box', action='store_true')
     parser.add_argument('--finetune_blocks', type=int, default=0)
     parser.add_argument('--wandb_name', type=str, required=True)
-    parser.add_argument('--epochs', type=int, default=35)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--accumulate_steps', type=int, default=1)
     parser.add_argument('--metrics_file', type=str, default='run_metrics.json')
 
@@ -45,10 +46,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_subpixel_coords(logits_heatmap):
+def get_subpixel_coords(logits_heatmap, temperature=2.0):
+    """
+    TEMPERATURE SOFTMAX FIX:
+    Eliminates 6-pixel quantization noise. Bleeds the one-hot peak to allow true float interpolation.
+    """
     B, T, H, W = logits_heatmap.shape
-    probs = torch.sigmoid(logits_heatmap).reshape(B * T, -1)
-    probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
+    probs = F.softmax((logits_heatmap.reshape(B * T, -1)) / temperature, dim=1)
     probs = probs.reshape(B, T, H, W)
     y_grid, x_grid = torch.meshgrid(torch.arange(H, device=probs.device), torch.arange(W, device=probs.device),
                                     indexing='ij')
@@ -88,7 +92,7 @@ def main():
         print(msg)
         with open(log_file, "a") as f: f.write(msg + "\n")
 
-    wandb.init(project="STATERA-Ablations", name=args.wandb_name, config=vars(args))
+    wandb.init(project="STATERA", name=args.wandb_name, config=vars(args))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f"[*] Initialized {args.wandb_name} on {device}")
 
@@ -96,11 +100,22 @@ def main():
         init_target = 'crescent' if args.target_type in ['twostage', 'dynamic_twostage'] else args.target_type
         start_sigma = 3.0 if args.static_sigma else 12.5
 
-        dataset = StateraDataset(args.dataset_path, target_type=init_target, start_sigma=start_sigma,
-                                 jitter_box=args.jitter_box)
-        train_size = int(0.8 * len(dataset))
-        val_size = len(dataset) - train_size
-        train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+        # DEEPCOPY FIX: Clone dataset to prevent jitter augmentation from poisoning validation
+        base_dataset = StateraDataset(args.dataset_path, target_type=init_target, start_sigma=start_sigma,
+                                      jitter_box=args.jitter_box)
+        train_size = int(0.8 * len(base_dataset))
+        val_size = len(base_dataset) - train_size
+
+        generator = torch.Generator().manual_seed(42)
+        train_indices, val_indices = random_split(range(len(base_dataset)), [train_size, val_size], generator=generator)
+
+        # Train set gets augmentations
+        train_ds = torch.utils.data.Subset(base_dataset, train_indices)
+
+        # Validation set cloned and stripped of augmentations
+        val_base_dataset = copy.deepcopy(base_dataset)
+        val_base_dataset.jitter_box = False
+        val_ds = torch.utils.data.Subset(val_base_dataset, val_indices)
 
         if args.scratch:
             batch_size = 2
@@ -137,14 +152,18 @@ def main():
         curriculum_patience_counter = 0
 
         for epoch in range(args.epochs):
-            funnel_ratio = min(1.0, epoch / 15.0)
+            # 50K SCALING FIX: Funnel converges at Epoch 2
+            funnel_ratio = min(1.0, epoch / 2.0)
 
+            # SYNCHRONOUS UPDATES: Validation set must shrink/morph at exact same rate as train
             if not args.static_sigma:
                 current_sigma = max(3.0, 12.5 - (9.5 * funnel_ratio))
                 train_ds.dataset.update_sigma(current_sigma)
+                val_ds.dataset.update_sigma(current_sigma)
 
-            if args.target_type in ['crescent', 'blend']:
+            if train_ds.dataset.target_type in ['crescent', 'blend']:
                 train_ds.dataset.update_phase_alpha(funnel_ratio)
+                val_ds.dataset.update_phase_alpha(funnel_ratio)
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -165,7 +184,8 @@ def main():
                 w_h, w_z = 0.0, 0.0
 
                 for f in range(16):
-                    w = 1.0 if args.temporal_weighting == 'uniform' else (f / 15.0) ** 2
+                    # FRAME 0 FIX: Geometric floor prevents gradients from erasing
+                    w = 1.0 if args.temporal_weighting == 'uniform' else max(0.05, (f / 15.0) ** 2)
 
                     if args.decoder_type == 'regression':
                         w_h += F.mse_loss(pred_h[:, f], gt_coords[:, f]) * w
@@ -182,7 +202,7 @@ def main():
                 loss.backward()
 
                 if (i + 1) % args.accumulate_steps == 0 or (i + 1) == len(train_loader):
-                    # Added Gradient Clipping to prevent explosion when backbone is unfrozen
+                    # GRADIENT CLIPPER: Prevents NaNs from Unchained Model
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -190,14 +210,12 @@ def main():
                 run_h += w_h.item() if isinstance(w_h, torch.Tensor) else float(w_h)
                 run_z += w_z.item() if isinstance(w_z, torch.Tensor) else float(w_z)
 
-            # Step the LR scheduler
-            scheduler.step()
-
             # Validation
             model.eval()
             val_h, val_z, total_px_err = 0.0, 0.0, 0.0
             all_batch_errors = []
             total_jitter_err = 0.0
+
             with torch.no_grad():
                 for vids, gt_h, gt_z, gt_coords in val_loader:
                     vids = vids.to(device)
@@ -208,7 +226,8 @@ def main():
                     pred_h, pred_z = model(vids)
 
                     for f in range(16):
-                        w = 1.0 if args.temporal_weighting == 'uniform' else (f / 15.0) ** 2
+                        w = 1.0 if args.temporal_weighting == 'uniform' else max(0.05, (f / 15.0) ** 2)
+
                         if args.decoder_type == 'regression':
                             val_h += F.mse_loss(pred_h[:, f], gt_coords[:, f]).item() * w
                         else:
@@ -256,11 +275,10 @@ def main():
                 "learning_rate": optimizer.param_groups[0]['lr']
             })
 
-            # DYNAMIC CURRICULUM PLATEAU CHECK (Premature Plateau Bug Eliminated)
-            if args.target_type == 'dynamic_twostage' and curriculum_stage == 'crescent':
-                safe_alpha = min(1.0, epoch / 5.0)
+            # 50K SCALING FIX: Plateau scope scaled to 2.0
+            if args.target_type in ['twostage', 'dynamic_twostage'] and curriculum_stage == 'crescent':
+                safe_alpha = min(1.0, epoch / 2.0)
 
-                # Only monitor plateau if the Crescent is fully formed
                 if safe_alpha >= 1.0:
                     if avg_val_h < (best_curriculum_loss - args.curriculum_delta):
                         best_curriculum_loss = avg_val_h
@@ -273,10 +291,20 @@ def main():
                         log("\n[>>] CURRICULUM PHASE SHIFT TRIGGERED: Plateau detected. Switching target to DOT.\n")
                         curriculum_stage = 'dot'
 
+                        train_ds.dataset.target_type = 'dot'
+                        train_ds.dataset.update_phase_alpha(1.0)
+
+                        val_ds.dataset.target_type = 'dot'
+                        val_ds.dataset.update_phase_alpha(1.0)
+
+                        best_curriculum_loss = float('inf')
+
             if args.save_checkpoint_every_epoch:
                 ckpt_path = os.path.join(args.checkpoint_dir, f"{args.wandb_name}_epoch_{epoch + 1}.pth")
                 torch.save(model.state_dict(), ckpt_path)
                 log(f"[✓] Saved checkpoint to: {ckpt_path}")
+
+            scheduler.step()
 
         plt.figure()
         plt.plot(train_h_losses, label='Train Loss')
