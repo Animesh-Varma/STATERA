@@ -14,8 +14,7 @@ def create_dummy_dataset(path="dummy_1k.hdf5"):
     """Generates a micro HDF5 dataset mimicking the real 1K subset."""
     print(f"[*] Generating synthetic HDF5 payload at {path}...")
     with h5py.File(path, 'w') as f:
-        # 2 dummy videos (Batch size 2)
-        f.create_dataset('videos', data=np.random.randint(0, 255, (2, 16, 384, 384, 3), dtype=np.uint8))
+        f.create_dataset('videos', data=np.random.randint(0, 255, (2, 16, 3, 384, 384), dtype=np.uint8))
         f.create_dataset('uv_coords', data=np.random.uniform(100, 200, (2, 16, 2)).astype(np.float32))
         f.create_dataset('box_center_uv', data=np.random.uniform(100, 200, (2, 16, 2)).astype(np.float32))
         f.create_dataset('z_depths', data=np.random.uniform(1.0, 5.0, (2, 16, 1)).astype(np.float32))
@@ -88,8 +87,6 @@ if __name__ == "__main__":
         test_dataset(dummy_path)
 
         # Testing the three core ablation backbones and configurations
-        # NOTE: DINOv2 is tested first as it downloads reliably.
-        # (V-JEPA assumes you have meta's repo locally cached or available)
         test_architecture('dinov2', 'none', 'deconv')
         test_architecture('resnet3d', 'conv1d', 'deconv')
         test_architecture('dinov2', 'transformer', 'mlp')
