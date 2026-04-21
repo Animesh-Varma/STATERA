@@ -19,11 +19,17 @@ class StateraModel(nn.Module):
         if self.backbone_type == 'vjepa':
             hub_out = torch.hub.load('facebookresearch/vjepa2', 'vjepa2_1_vit_large_384')
             self.backbone = hub_out[0] if isinstance(hub_out, tuple) else hub_out
+            self.embed_dim = 1024
         elif self.backbone_type == 'dinov2':
             hub_out = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
             self.backbone = hub_out[0] if isinstance(hub_out, tuple) else hub_out
-
-        self.embed_dim = 1024
+            self.embed_dim = 1024
+        elif self.backbone_type == 'resnet3d':
+            from torchvision.models.video import r3d_18, R3D_18_Weights
+            self.backbone = r3d_18(weights=R3D_18_Weights.DEFAULT)
+            # Remove the AdaptiveAvgPool3d and FC layer to preserve spatial map
+            self.backbone = nn.Sequential(*list(self.backbone.children())[:-2])
+            self.embed_dim = 512
 
         if self.scratch:
             self.backbone.apply(self._init_weights)
@@ -32,13 +38,20 @@ class StateraModel(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-            if self.finetune_blocks > 0 and hasattr(self.backbone, 'blocks'):
-                for block in self.backbone.blocks[-self.finetune_blocks:]:
-                    for param in block.parameters():
-                        param.requires_grad = True
-                if hasattr(self.backbone, 'norm'):
-                    for param in self.backbone.norm.parameters():
-                        param.requires_grad = True
+            if self.finetune_blocks > 0:
+                if hasattr(self.backbone, 'blocks'):
+                    for block in self.backbone.blocks[-self.finetune_blocks:]:
+                        for param in block.parameters():
+                            param.requires_grad = True
+                    if hasattr(self.backbone, 'norm'):
+                        for param in self.backbone.norm.parameters():
+                            param.requires_grad = True
+                elif self.backbone_type == 'resnet3d':
+                    for i in range(1, self.finetune_blocks + 1):
+                        layer_idx = 5 - i
+                        if layer_idx >= 1:
+                            for param in self.backbone[layer_idx].parameters():
+                                param.requires_grad = True
 
         if self.temporal_mixer == 'conv1d':
             self.temp_net = nn.Sequential(nn.Conv1d(self.embed_dim, self.embed_dim, kernel_size=3, padding=1),
@@ -46,10 +59,8 @@ class StateraModel(nn.Module):
         elif self.temporal_mixer == 'transformer':
             layer = nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=8, batch_first=True)
             self.temp_net = nn.TransformerEncoder(layer, num_layers=2)
-            # FIXED: Added required Positional Embeddings for the temporal transformer mixer
             self.pos_embed = nn.Parameter(torch.zeros(1, 16, self.embed_dim))
             nn.init.normal_(self.pos_embed, std=0.02)
-
         elif self.temporal_mixer == 'none':
             self.temp_net = nn.Identity()
 
@@ -114,6 +125,19 @@ class StateraModel(nn.Module):
             tokens = tokens.reshape(B, 16, self.embed_dim, 576).permute(0, 1, 3, 2)
             T_current = 16
 
+        elif self.backbone_type == 'resnet3d':
+            # Resnet3d expects[B, C, T, H, W]
+            x_inter = x.permute(0, 2, 1, 3, 4)
+            with torch.set_grad_enabled(enable_grad):
+                out = self.backbone(x_inter)  # Shape: B, 512, 2, 24, 24
+
+            # [FIXED]: Upsample temporally to 16, keep spatial 24x24 to exactly match ViT (576 patches)
+            out = F.interpolate(out, size=(16, 24, 24), mode='trilinear', align_corners=False)
+
+            # Format to [B, T, SpatialPatches, C]
+            tokens = out.permute(0, 2, 1, 3, 4).reshape(B, 16, self.embed_dim, 576).permute(0, 1, 3, 2)
+            T_current = 16
+
         if self.decoder_type in ['mlp', 'regression']:
             weights = self.pooler(tokens)
             feat = torch.sum(tokens * weights, dim=2)
@@ -125,7 +149,7 @@ class StateraModel(nn.Module):
                 if self.temporal_mixer == 'conv1d':
                     feat = self.temp_net(feat.transpose(1, 2)).transpose(1, 2)
                 elif self.temporal_mixer == 'transformer':
-                    feat = feat + self.pos_embed[:, :feat.size(1), :]  # Add pos embed
+                    feat = feat + self.pos_embed[:, :feat.size(1), :]
                     feat = self.temp_net(feat)
             else:
                 B_curr, T_curr, P_curr, C_curr = feat.shape
@@ -135,7 +159,7 @@ class StateraModel(nn.Module):
                     feat = feat_flat.permute(0, 2, 1).reshape(B_curr, P_curr, T_curr, C_curr).permute(0, 2, 1, 3)
                 elif self.temporal_mixer == 'transformer':
                     feat_flat = feat.permute(0, 2, 1, 3).reshape(B_curr * P_curr, T_curr, C_curr)
-                    feat_flat = feat_flat + self.pos_embed[:, :T_curr, :]  # Add pos embed
+                    feat_flat = feat_flat + self.pos_embed[:, :T_curr, :]
                     feat_flat = self.temp_net(feat_flat)
                     feat = feat_flat.reshape(B_curr, P_curr, T_curr, C_curr).permute(0, 2, 1, 3)
 
@@ -158,7 +182,9 @@ class StateraModel(nn.Module):
             out = self.coord_head(feat_condensed)
             z_feat = feat_condensed
         elif self.decoder_type == 'deconv':
-            grid_feat = feat.reshape(B * 16, 24, 24, self.embed_dim).permute(0, 3, 1, 2)
+            P_curr = feat.shape[2]
+            spatial_dim = int(P_curr ** 0.5)
+            grid_feat = feat.reshape(B * 16, spatial_dim, spatial_dim, self.embed_dim).permute(0, 3, 1, 2)
             out = self.deconv_net(grid_feat).reshape(B, 16, self.heatmap_res, self.heatmap_res)
             if not self.single_task:
                 z_w = self.z_pooler(feat)

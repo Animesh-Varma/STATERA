@@ -50,6 +50,22 @@ class StateraDataset(Dataset):
         box_np = self.h5_file['box_center_uv'][idx].reshape(16, 2)
         z_depth_np = self.h5_file['z_depths'][idx]
 
+        # EXTRACT BOUNDING BOX DIAGONAL (For N-CoME normalization)
+        try:
+            # If dataset directly stores box width and height
+            box_dims_np = self.h5_file['box_dims'][idx].reshape(16, 2)
+        except KeyError:
+            try:
+                # If dataset stores bounding boxes as[x1, y1, x2, y2]
+                bboxes = self.h5_file['bboxes'][idx].reshape(16, 4)
+                box_dims_np = np.stack([bboxes[:, 2] - bboxes[:, 0], bboxes[:, 3] - bboxes[:, 1]], axis=1)
+            except KeyError:
+                # Safe geometric fallback if neither exists (assumes standard 50px box)
+                box_dims_np = np.ones((16, 2), dtype=np.float32) * 50.0
+
+        # Calculate standard hypotenuse: sqrt(W^2 + H^2)
+        bbox_diag = torch.sqrt(torch.tensor(box_dims_np[:, 0]**2 + box_dims_np[:, 1]**2, dtype=torch.float32) + 1e-8)
+
         video = torch.from_numpy(video_np).float() / 255.0
         video = video.permute(1, 0, 2, 3)
 
@@ -108,4 +124,4 @@ class StateraDataset(Dataset):
         else:
             raise ValueError(f"Unknown target type: {self.target_type}")
 
-        return video, heatmap, z_depth, true_uv
+        return video, heatmap, z_depth, true_uv, bbox_diag
