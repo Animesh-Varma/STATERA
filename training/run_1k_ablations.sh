@@ -5,14 +5,14 @@ echo "{}" > 1k_ablation_metrics.json
 # 1. Run-00-SOTA-1K-Anchor (The Core Baseline at 1K)
 python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone vjepa --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --metrics_file 1k_ablation_metrics.json --wandb_name Run-00-SOTA-1K-Anchor --temperature 2.0 --finetune_blocks 2
 
-# 2. Run-01-Spatial-Only-DINOv2 (Testing pure spatial representation devoid of temporal mechanics)
-python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer none --target_type crescent --backbone dinov2 --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --metrics_file 1k_ablation_metrics.json --wandb_name Run-01-Spatial-Only-DINOv2 --temperature 2.0 --finetune_blocks 2
+# 2. Run-01-DINOv2-Matched (Fair Comparison: Given same temporal mixer and unfrozen blocks as SOTA)
+python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone dinov2 --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --metrics_file 1k_ablation_metrics.json --wandb_name Run-01-DINOv2-Matched --temperature 2.0 --finetune_blocks 2
 
-# 3. Run-02-No-Temporal-Mixer (Testing cross-frame mixing necessity within equivalent architecture)
+# 3. Run-02-No-Temporal-Mixer (Testing cross-frame mixing necessity within SOTA architecture)
 python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer none --target_type crescent --backbone vjepa --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --metrics_file 1k_ablation_metrics.json --wandb_name Run-02-No-Temporal-Mixer --temperature 2.0 --finetune_blocks 2
 
-# 4. Run-03-External-Temporal-ResNet3D (The standard 3D CNN baseline, hardware optimized via accumulated constraints)
-python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone resnet3d --epochs 30 --funnel_epochs 6 --batch_size_override 2 --accumulate_steps 12 --metrics_file 1k_ablation_metrics.json --wandb_name Run-03-External-Temporal-ResNet3D --temperature 2.0 --finetune_blocks 0
+# 4. Run-03-External-Temporal-ResNet3D (Fair Comparison: Top 2 blocks unfrozen, effective batch size 24)
+python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone resnet3d --epochs 30 --funnel_epochs 6 --batch_size_override 2 --accumulate_steps 12 --metrics_file 1k_ablation_metrics.json --wandb_name Run-03-External-Temporal-ResNet3D --temperature 2.0 --finetune_blocks 2
 
 # 5. Run-04-No-Curriculum-Static-Dot (Tests "Expectation Collapse" against a fixed, non-shrinking target)
 python train.py --dataset_path ../sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type dot --static_sigma --backbone vjepa --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --metrics_file 1k_ablation_metrics.json --wandb_name Run-04-No-Curriculum-Static-Dot --temperature 2.0 --finetune_blocks 2
