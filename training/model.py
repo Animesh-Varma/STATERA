@@ -126,12 +126,10 @@ class StateraModel(nn.Module):
             T_current = 16
 
         elif self.backbone_type == 'resnet3d':
-            # Resnet3d expects[B, C, T, H, W]
-            x_inter = x.permute(0, 2, 1, 3, 4)
+            x_inter = x
             with torch.set_grad_enabled(enable_grad):
                 out = self.backbone(x_inter)  # Shape: B, 512, 2, 24, 24
 
-            # [FIXED]: Upsample temporally to 16, keep spatial 24x24 to exactly match ViT (576 patches)
             out = F.interpolate(out, size=(16, 24, 24), mode='trilinear', align_corners=False)
 
             # Format to [B, T, SpatialPatches, C]

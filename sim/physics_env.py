@@ -238,7 +238,7 @@ def generate_statera_episode(dataset_file, episode_index):
 
 
 if __name__ == "__main__":
-    NUM_EPISODES = 50000
+    NUM_EPISODES = 1000
     print(f"Initializing STATERA Pipeline (PyTorch Structuring for {NUM_EPISODES} episodes)...")
 
     wandb.init(project="STATERA-DataGen", job_type="generation")
@@ -250,7 +250,7 @@ if __name__ == "__main__":
         "impact_frames": []
     }
 
-    with h5py.File("HiddenMass-50K.hdf5", "w") as f:
+    with h5py.File("1K-ablation.hdf5", "w") as f:
         f.create_dataset("videos",
                          shape=(NUM_EPISODES, 16, 3, 384, 384),
                          dtype=np.uint8,
