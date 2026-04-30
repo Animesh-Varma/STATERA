@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import cv2
+import argparse
 from tqdm import tqdm
 from statera.model import StateraModel
 
@@ -20,15 +21,17 @@ def get_subpixel_coords(logits_heatmap, temperature=2.0):
     return torch.stack([x_center, y_center], dim=2)
 
 
-def load_sota_model(device):
-    ckpt_path = 'sota_50k_sigma_checkpoints/STATERA-50K-Sigma_epoch_10.pth'
-    print(f"[*] Loading SOTA Champion Weights: {ckpt_path}")
+def load_sota_model(checkpoint_path, device):
+    print(f"[*] Loading Model Weights: {checkpoint_path}")
+
+    # Matching the SOTA model initialization used in evaluate.py's run_real_world
     model = StateraModel(
-        decoder_type='deconv', temporal_mixer='conv1d',
-        single_task=False, backbone_type='vjepa',
-        scratch=False, finetune_blocks=0
+        decoder_type='deconv',
+        temporal_mixer='conv1d',
+        backbone_type='vjepa'
     ).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.eval()
     return model
 
@@ -47,19 +50,28 @@ def process_heatmap_overlay(logits, frame_bgr):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Render Heatmaps for STATERA Models")
+    parser.add_argument('--checkpoint', type=str, required=True, help="Path to the model checkpoint")
+    parser.add_argument('--data_dir', type=str, default='sim2real/output', help="Path to real-world .h5 sequences")
+    parser.add_argument('--out_dir', type=str, required=True, help="Output directory for the rendered videos")
+    parser.add_argument('--run_name', type=str, default='STATERA SOTA', help="Display name for the video overlay")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Initialize SOTA Model
-    model = load_sota_model(device)
+    # 1. Initialize Model
+    if not os.path.exists(args.checkpoint):
+        print(f"[!] Checkpoint not found at: {args.checkpoint}")
+        return
+
+    model = load_sota_model(args.checkpoint, device)
 
     # 2. Path Setup
-    data_dir = '../sim2real/output'
-    out_dir = "SOTA_50k_sigma_all_heatmaps"
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    h5_files = sorted(glob.glob(os.path.join(data_dir, '*_statera.h5')))
+    h5_files = sorted(glob.glob(os.path.join(args.data_dir, '*_statera.h5')))
     if not h5_files:
-        print(f"[!] No .h5 files found in {data_dir}!")
+        print(f"[!] No .h5 files found in {args.data_dir}!")
         return
 
     print(f"[*] Found {len(h5_files)} video databases. Commencing Render...")
@@ -83,19 +95,20 @@ def main():
                 # Inference
                 with torch.no_grad():
                     pred_h, _ = model(vids_tensor)
-                    pred_h = pred_h[0]  # [16, 64, 64]
+                    # Coordinate Extraction (Scale factor 384/64 = 6.0)
+                    coords = get_subpixel_coords(pred_h, 2.0)[0] * 6.0
 
-                    # Coordinate Extraction
-                    coords = get_subpixel_coords(pred_h.unsqueeze(0), 2.0)[0] * (384.0 / 64.0)
+                    pred_h_frames = pred_h[0]  # Grab the 16 frames for the first batch item
                     coords = coords.cpu().numpy()
 
                 # Save Settings
-                out_path = os.path.join(out_dir, f"{vid_base}_{seq_name}_SOTA_Heatmap.mp4")
+                out_path = os.path.join(args.out_dir,
+                                        f"{vid_base}_{seq_name}_{args.run_name.replace(' ', '_')}_Heatmap.mp4")
                 writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), 5.0, (384, 384))
 
                 for i in range(16):
                     # Step A: Overlay Heatmap
-                    img = process_heatmap_overlay(pred_h[i], frames_bgr[i])
+                    img = process_heatmap_overlay(pred_h_frames[i], frames_bgr[i])
 
                     # Step B: Draw Ground Truth (White Crosshair)
                     gt_pt = (int(gt_u[i]), int(gt_v[i]))
@@ -106,14 +119,14 @@ def main():
                     cv2.circle(img, pr_pt, 5, (0, 0, 0), -1)
 
                     # Step D: Labels
-                    cv2.putText(img, "STATERA 50K SOTA", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(img, args.run_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     cv2.putText(img, f"Seq: {seq_name}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
                     writer.write(img)
 
                 writer.release()
 
-    print(f"\n[✓] DONE. All heatmaps rendered to '{out_dir}/'")
+    print(f"\n[✓] DONE. All heatmaps rendered to '{args.out_dir}/'")
 
 
 if __name__ == "__main__":
