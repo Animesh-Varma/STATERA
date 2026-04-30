@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 from tqdm import tqdm
-from model import StateraModel
+from statera.model import StateraModel
 
 
 def get_subpixel_coords(logits_heatmap, temperature=2.0):
