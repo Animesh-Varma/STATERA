@@ -41,13 +41,13 @@ def main():
     loader = DataLoader(val_ds, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
 
     checkpoints = {
-        "Run-00-Anchor": "-",
-        "Run-04-StaticDot": "-",
-        "Run-05-StdSigma": "-",
+        "Run-00-Anchor": "checkpoints/Run-00-Anchor-Saved_epoch_30.pth",
+        "Run-04-StaticDot": "checkpoints/Run-04-Static-Dot-Saved_epoch_30.pth",
+        "Run-05-StdSigma": "checkpoints/Run-05-Standard-Sigma-Saved_epoch_30.pth",
         "Run-01-DINOv2": "checkpoints/Run-01-DINOv2_epoch_23.pth",
-        "Run-03-ResNet3D": "-",
-        "SOTA-Crescent": "-",
-        "SOTA-Sigma": "-"
+        "Run-03-ResNet3D": "checkpoints/Run-03-ResNet3D-Fixed_epoch_30.pth",
+        "SOTA-Crescent": "sota_50k_checkpoints/STATERA-50K-SOTA_epoch_7.pth",
+        "SOTA-Sigma": "sota_50k_sigma_checkpoints/STATERA-50K-Sigma_epoch_10.pth"
     }
 
     print(f"\n{'TABLE 1: IN-DOMAIN SIMULATION PERFORMANCE':^75}")
