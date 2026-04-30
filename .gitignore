@@ -20,6 +20,15 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
 # Weights & Biases
 wandb/
 *wandb*
+
+# Run Outputs and Local Configs
+*_metrics.json
+variables.txt
+
+# Generated Physical Assets
+STATERA_Checkerboard.pdf
+STATERA_Markers_A4.pdf
