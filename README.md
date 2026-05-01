@@ -24,17 +24,11 @@ Alongside the model, we are releasing the **HiddenMass Benchmark**: 50,000 proce
 
 ## Resources & Checkpoints
 
-<div align="left">
-    <a href="https://huggingface.co/Animesh-null/STATERA">
-        <img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo-with-title.svg" alt="Models on Hugging Face" height="40">
-    </a>
-    &nbsp;&nbsp;&nbsp;&nbsp;
-    <a href="https://huggingface.co/datasets/Animesh-null/HiddenMass-50K">
-        <img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo-with-title.svg" alt="Dataset on Hugging Face" height="40">
-    </a>
-</div>
+[![Model on Hugging Face](https://img.shields.io/badge/Model-STATERA-%23ffd21e?logo=huggingface&logoColor=000)](https://huggingface.co/Animesh-null/STATERA)
+[![Dataset on Hugging Face](https://img.shields.io/badge/Dataset-HiddenMass--50K-%23ffd21e?logo=huggingface&logoColor=000)](https://huggingface.co/datasets/Animesh-null/HiddenMass-50K)
 
-*Note: The dataset repository is currently a Work In Progress (WIP).*
+*Note: The dataset repository is currently a Work In Progress (WIP) and the model cards/READMEs are still unfilled for both.*
+
 
 ---
 
@@ -44,7 +38,7 @@ Alongside the model, we are releasing the **HiddenMass Benchmark**: 50,000 proce
   <a href="#features">Features</a> •
   <a href="#interactive-demo">Interactive Demo</a> •
   <a href="#how-it-works">How It Works</a> •
-  <a href="#the-metric-illusion">The Metric Illusion</a>
+  <a href="#the-metric-illusion--evaluation-suite">The Evaluation Suite</a>
   <br>
   <a href="#benchmark-results">Benchmark</a> •
   <a href="#model-zoo">Model Zoo</a> •
@@ -84,7 +78,6 @@ Alongside the model, we are releasing the **HiddenMass Benchmark**: 50,000 proce
     </tr>
   </table>
 </div>
----
 
 ## How It Works
 
