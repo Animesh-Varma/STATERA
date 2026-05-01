@@ -1,3 +1,4 @@
+
 # STATERA
 **Hidden Mass Estimation via Zero-Shot Sim-to-Real Kinematics using Frozen Temporal Tubelets**
 
@@ -68,9 +69,20 @@ Alongside the model, we are releasing the **HiddenMass Benchmark**: 50,000 proce
 ## Interactive Demo
 
 <div align="center">
-  <img src="assets/demo_recording.gif" alt="STATERA Demo Screen Recording" width="80%">
-  <br>
-  <i>Screen recording of the STATERA interactive Material 3 web app evaluating a tumbling sequence in real-time.</i>
+  <table>
+    <tr>
+      <td align="center">
+        <img src="https://github.com/user-attachments/assets/1aee3f9f-8fe4-4bc1-83d8-79fd2b92d35b" alt="Evaluating Uploaded Data" width="100%">
+        <br>
+        <i>Evaluating Custom Uploaded Data</i>
+      </td>
+      <td align="center">
+        <img src="https://github.com/user-attachments/assets/7fb9a78e-cbcb-406c-95aa-34598888feb2" alt="Evaluating Demo Data" width="100%">
+        <br>
+        <i>Evaluating Pre-Loaded Demo Sequences</i>
+      </td>
+    </tr>
+  </table>
 </div>
 
 ---
