@@ -72,19 +72,18 @@ Alongside the model, we are releasing the **HiddenMass Benchmark**: 50,000 proce
   <table>
     <tr>
       <td align="center">
-        <img src="https://github.com/user-attachments/assets/1aee3f9f-8fe4-4bc1-83d8-79fd2b92d35b" alt="Evaluating Uploaded Data" width="100%">
+        <video src="https://github.com/user-attachments/assets/1aee3f9f-8fe4-4bc1-83d8-79fd2b92d35b" width="400" controls autoplay loop muted playsinline></video>
         <br>
         <i>Evaluating Custom Uploaded Data</i>
       </td>
       <td align="center">
-        <img src="https://github.com/user-attachments/assets/7fb9a78e-cbcb-406c-95aa-34598888feb2" alt="Evaluating Demo Data" width="100%">
+        <video src="https://github.com/user-attachments/assets/7fb9a78e-cbcb-406c-95aa-34598888feb2" width="400" controls autoplay loop muted playsinline></video>
         <br>
         <i>Evaluating Pre-Loaded Demo Sequences</i>
       </td>
     </tr>
   </table>
 </div>
-
 ---
 
 ## How It Works
