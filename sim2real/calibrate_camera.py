@@ -1,9 +1,3 @@
-"""
-2_calibrate_camera.py
-Generates a printable checkerboard, extracts randomly spread calibration frames
-from a video file, and calculates the Intrinsic Camera Matrix (K).
-"""
-
 import cv2
 import numpy as np
 import glob

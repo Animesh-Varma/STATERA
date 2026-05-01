@@ -1,9 +1,3 @@
-"""
-1_generate_markers.py
-Generates ArUco markers with physical sizing driven by TUI inputs.
-Compiles them automatically into a perfectly scaled, printable A4 PDF.
-"""
-
 import cv2
 import os
 import numpy as np

@@ -518,14 +518,33 @@ HTML_CONTENT = """
                         <span class="material-symbols-rounded">close</span>
                     </button>
                 </div>
+
                 <video id="modalVidPlayer" class="w-full rounded-2xl max-h-[45vh] bg-black mb-6 shadow-xl object-contain"></video>
+
                 <div class="w-full bg-m3-surface rounded-2xl p-4 mb-6 shadow-inner border border-white/5">
+
+                    <!-- UPDATED: Frame Sync Header -->
                     <div class="flex justify-between items-center mb-4">
-                        <span id="timeLabel" class="text-sm font-medium text-m3-primary font-mono">Segment: 0.00s to 0.66s</span>
-                        <button id="btnPreviewSegment" class="text-xs font-medium text-m3-onSecondaryContainer bg-m3-secondaryContainer px-3 py-1.5 rounded-full hover:bg-m3-secondaryContainer/80 transition flex items-center gap-1">
+                        <div class="flex items-center gap-4">
+                            <span id="timeLabel" class="text-sm font-medium text-m3-primary font-mono">Segment: 0.00s to 0.53s</span>
+
+                            <!-- New FPS Selector to match exact Backend extraction logic -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs font-medium text-m3-textVariant uppercase tracking-wider">Source FPS:</span>
+                                <select id="videoFpsSelect" class="bg-m3-bg border border-m3-outlineVariant text-m3-text text-xs rounded px-2 py-1 outline-none focus:border-m3-primary transition-colors cursor-pointer">
+                                    <option value="24">24 fps</option>
+                                    <option value="25">25 fps</option>
+                                    <option value="30" selected>30 fps</option>
+                                    <option value="60">60 fps</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <button id="btnPreviewSegment" class="text-xs font-medium text-m3-onSecondaryContainer bg-m3-secondaryContainer px-3 py-1.5 rounded-full hover:bg-m3-secondaryContainer/80 transition flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed">
                             <span class="material-symbols-rounded text-[16px]">play_circle</span> Preview 16 Frames
                         </button>
                     </div>
+
                     <div class="timeline-container">
                         <div class="timeline-track"></div>
                         <div id="timelineSegment" class="timeline-segment"></div>
@@ -786,8 +805,16 @@ HTML_CONTENT = """
         const timelineSlider = document.getElementById('timelineSlider');
         const timelineSegment = document.getElementById('timelineSegment');
         const timeLabel = document.getElementById('timeLabel');
-        const fpsEstimate = 24.0;
-        const segmentDuration = 16 / fpsEstimate;
+
+        // --- FPS Synchronization Updates ---
+        let fpsEstimate = 30.0;
+        let segmentDuration = 16 / fpsEstimate;
+
+        document.getElementById('videoFpsSelect').addEventListener('change', (e) => {
+            fpsEstimate = parseFloat(e.target.value);
+            segmentDuration = 16 / fpsEstimate;
+            initTimeline();
+        });
 
         function initTimeline() {
             if (!modalVidPlayer.duration || isNaN(modalVidPlayer.duration)) return;
@@ -814,18 +841,30 @@ HTML_CONTENT = """
 
         timelineSlider.addEventListener('input', () => { updateTimeline(); modalVidPlayer.pause(); });
 
-        let previewInterval;
-        document.getElementById('btnPreviewSegment').onclick = () => {
-            clearInterval(previewInterval);
+        // Force browser to mathematically render exactly the 16 frames the backend will extract
+        document.getElementById('btnPreviewSegment').onclick = async () => {
+            const btn = document.getElementById('btnPreviewSegment');
+            if (btn.disabled) return;
+            btn.disabled = true;
+            modalVidPlayer.pause();
+
             const startVal = parseFloat(timelineSlider.value);
-            const endVal = startVal + segmentDuration;
+
+            for(let i = 0; i < 16; i++) {
+                modalVidPlayer.currentTime = startVal + (i / fpsEstimate);
+                // Await browser render pipeline
+                await new Promise(r => {
+                    const onSeeked = () => { modalVidPlayer.removeEventListener('seeked', onSeeked); r(); };
+                    modalVidPlayer.addEventListener('seeked', onSeeked);
+                    // Safe fallback if frame is already buffered
+                    setTimeout(() => { modalVidPlayer.removeEventListener('seeked', onSeeked); r(); }, 100);
+                });
+                // Hold frame to simulate playback speed
+                await new Promise(r => setTimeout(r, 1000 / fpsEstimate));
+            }
+
             modalVidPlayer.currentTime = startVal;
-            modalVidPlayer.play();
-            previewInterval = setInterval(() => {
-                if(modalVidPlayer.currentTime >= endVal || modalVidPlayer.paused) {
-                    modalVidPlayer.pause(); modalVidPlayer.currentTime = startVal; clearInterval(previewInterval);
-                }
-            }, 30);
+            btn.disabled = false;
         };
 
         document.getElementById('videoUpload').onchange = (e) => {
@@ -873,11 +912,11 @@ HTML_CONTENT = """
         }
 
         document.getElementById('btnCloseModal').onclick = () => {
-            prepModal.classList.add('hidden'); modalVidPlayer.pause(); clearInterval(previewInterval);
+            prepModal.classList.add('hidden'); modalVidPlayer.pause();
         };
 
         document.getElementById('btnNextStep').onclick = () => {
-            modalVidPlayer.pause(); clearInterval(previewInterval);
+            modalVidPlayer.pause(); 
             step2Scrubber.value = 0; step2FrameLabel.innerText = 'Frame 1/16';
             modalVidFrame.src = modalVidPlayer.src; modalVidFrame.currentTime = timelineSlider.value;
             modalStep1.classList.add('hidden'); modalStep2.classList.remove('hidden');

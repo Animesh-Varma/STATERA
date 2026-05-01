@@ -1,11 +1,3 @@
-"""
-4_evaluate_benchmark.py
-STATERA Benchmarking Script.
-*REFINED*:
-- Evaluates Kinematic Jitter (Acceleration Deviation) to prove temporal smoothness.
-- Dynamically loads exact Crop Bounds from the JSON to align mathematical spaces.
-"""
-
 import os
 import sys
 import glob
