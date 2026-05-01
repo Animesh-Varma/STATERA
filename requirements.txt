@@ -1,20 +1,22 @@
-# Requires Python 3.12
+# Python 3.12 Required
 mujoco
 numpy
 h5py
 opencv-python
+opencv-contrib-python
 albumentations
 torch
+torchvision
 timm
 einops
-torchvision
 matplotlib
 fastapi
 uvicorn
 python-multipart
-opencv-contrib-python
 pillow
 wandb
 moviepy
 imageio
 imageio-ffmpeg
+scipy
+tqdm

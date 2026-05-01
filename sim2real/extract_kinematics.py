@@ -1,12 +1,3 @@
-"""
-3_extract_kinematics_batch.py
-Sim-to-Real Test Dataset Generator.
-*PHYSICS PATCHED*:
-- Removes toxic Euler wrapping on Rodrigues vectors.
-- Implements proper Scipy Quaternion continuity and SLERP-like smoothing.
-- Removes PnP cold-start snapping to prevent Savitzky-Golay ringing/hooks.
-"""
-
 import cv2
 import numpy as np
 import json
