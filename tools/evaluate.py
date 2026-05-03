@@ -22,13 +22,13 @@ from statera.dataset import StateraDataset
 from statera.model import StateraModel
 
 CHECKPOINTS = {
-    "Run-00-Anchor": "scripts/checkpoints/Run-00-Anchor-Saved_epoch_30.pth",
-    "Run-04-StaticDot": "scripts/checkpoints/Run-04-Static-Dot-Saved_epoch_30.pth",
-    "Run-05-StdSigma": "scripts/checkpoints/Run-05-Standard-Sigma-Saved_epoch_30.pth",
-    "Run-01-DINOv2": "scripts/checkpoints/Run-01-DINOv2-Fixed_epoch_30.pth",
-    "Run-03-ResNet3D": "scripts/checkpoints/Run-03-ResNet3D-Fixed_epoch_30.pth",
-    "SOTA-Crescent": "scripts/sota_50k_crescent_checkpoints/STATERA-50K-Crescent-SOTA_epoch_7.pth",
-    "SOTA-Sigma": "scripts/sota_50k_sigma_checkpoints/STATERA-50K-Sigma_epoch_10.pth"
+    "Run-00-Anchor": ".checkpoints/STATERA-1K-Anchor.pth",
+    "Run-04-StaticDot": ".checkpoints/Run-04-Static-Dot.pth",
+    "Run-05-StdSigma": ".checkpoints/Run-05-Standard-Sigma.pth",
+    "Run-01-DINOv2": ".checkpoints/Run-01-DINOv2.pth",
+    "Run-03-ResNet3D": ".checkpoints/Run-03-ResNet3D.pth",
+    "SOTA-Crescent": ".sota_50k_crescent_checkpoints/STATERA-50K-Crescent.pth",
+    "SOTA-Sigma": ".sota_50k_sigma_checkpoints/STATERA-50K-Sigma.pth"
 }
 
 

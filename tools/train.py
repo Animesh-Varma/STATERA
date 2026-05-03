@@ -10,9 +10,12 @@ import wandb
 import argparse
 import traceback
 import copy
+import sys
 
-from dataset import StateraDataset
-from model import StateraModel
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from statera.dataset import StateraDataset
+from statera.model import StateraModel
 
 
 def parse_args():
