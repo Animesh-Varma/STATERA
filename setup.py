@@ -1,7 +1,6 @@
 import sys
 import os
 import subprocess
-import urllib.request
 import shutil
 import glob
 
@@ -48,7 +47,6 @@ def bootstrap():
     is_312 = (sys.version_info.major == 3 and sys.version_info.minor == 12)
     in_venv = (sys.prefix != sys.base_prefix)
 
-    # --- WRONG PYTHON VERSION DETECTED ---
     if not is_312:
         print(f"[!] You are currently running Python {sys.version_info.major}.{sys.version_info.minor}.")
         print("    STATERA strictly requires Python 3.12.")
@@ -86,8 +84,6 @@ def bootstrap():
             sys.exit(1)
 
         relaunch_in_venv()
-
-    # --- CORRECT PYTHON VERSION ---
     else:
         if not in_venv:
             print("[*] No virtual environment detected.")
@@ -108,7 +104,6 @@ def patch_and_download_vjepa():
     print("\n[*] Initializing PyTorch Hub to patch Meta's V-JEPA2 localhost bug...")
     import torch
 
-    # 1. Force the download/extraction of the V-JEPA2 repository code
     try:
         torch.hub.help('facebookresearch/vjepa2', 'vjepa2_1_vit_large_384', trust_repo=True)
     except Exception:
@@ -121,7 +116,6 @@ def patch_and_download_vjepa():
         print("    [!] V-JEPA2 repo not found in cache. Could not apply bug patch.")
         return
 
-    # 2. Scan and patch all python files containing the internal localhost URL on Disk
     bug_fixed = False
     for filepath in glob.glob(os.path.join(vjepa_dir, '**', '*.py'), recursive=True):
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -129,7 +123,6 @@ def patch_and_download_vjepa():
 
         if 'http://localhost:8300' in content:
             print(f"    [!] Found buggy localhost URL in {os.path.basename(filepath)}. Patching...")
-            # Replace local dev URL with Meta's actual public S3 bucket
             content = content.replace('http://localhost:8300', 'https://dl.fbaipublicfiles.com/vjepa2')
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(content)
@@ -137,46 +130,65 @@ def patch_and_download_vjepa():
 
     if bug_fixed:
         print("    [✓] V-JEPA2 localhost bug successfully patched on disk.")
-    else:
-        print("    [✓] No buggy localhost URL found (already patched).")
 
-    # 3. Pre-download the weights using a FRESH Subprocess so Python's memory cache is forced to read the patched file
     print("[*] Pre-downloading V-JEPA 2 Backbone weights (this may take a few minutes)...")
-
     download_script = """
 import torch
-print("    -> Spawning fresh Python process to load patched V-JEPA2...")
 torch.hub.load('facebookresearch/vjepa2', 'vjepa2_1_vit_large_384', trust_repo=True)
 print("    [✓] V-JEPA 2 weights downloaded and cached successfully.")
 """
     try:
-        venv_python = get_venv_python()
-        subprocess.check_call([venv_python, "-c", download_script])
+        subprocess.check_call([get_venv_python(), "-c", download_script])
     except Exception as e:
         print(f"    [!] Warning: Failed to pre-download V-JEPA 2 weights: {e}")
 
 
 # =================================================================
-# 3. MAIN SETUP ROUTINE
+# 3. UTILITY: READ HF_TOKEN FROM .ENV
+# =================================================================
+def get_hf_token():
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        return token
+
+    if os.path.exists(".env"):
+        with open(".env", "r") as f:
+            for line in f:
+                if line.strip().startswith("HF_TOKEN="):
+                    return line.strip().split("=", 1)[1].strip('"\'')
+    return None
+
+
+# =================================================================
+# 4. MAIN SETUP ROUTINE
 # =================================================================
 def run_setup():
-    print("==================================================")
-    print("             STATERA Setup Utility                ")
-    print("==================================================")
-    print("Select an installation mode:")
-    print("  [1] Full Installation (Training, Baselines, MuJoCo, WandB, TapNet)")
-    print("[2] Demo Installation (Inference, Web App, & core dependencies only)")
+    print("==============================================================================")
+    print("                              STATERA Setup Utility                           ")
+    print("==============================================================================")
+    print("Please select an installation mode:")
+    print("\n[1] Demo Installation")
+    print("    -> Installs minimal dependencies (Inference, Web App).")
+    print("    -> Downloads ONLY the primary SOTA checkpoint and the V-jepa backbone (~9.2 GB total).")
+    print("    -> Best for trying out the tracking demo or quick local inference.")
+    print("\n[2] Full Experimental Result Reproducibility")
+    print("    -> Installs all dependencies (Training, Eval, Baselines, WandB, Hub).")
+    print("    -> Clones external baseline repositories (DeepMind TAPNET).")
+    print("    -> Downloads ALL model checkpoints & 1K ablations (~10 GB total).")
+    print("    -> Downloads the complete Public Test HDF5 Dataset (~50 GB).")
+    print("    -> Capable of strictly reproducing all Context Tables from the paper.")
+    print("==============================================================================\n")
 
     choice = ""
     while choice not in ["1", "2"]:
-        choice = input("\nEnter 1 or 2: ").strip()
+        choice = input("Enter 1 or 2: ").strip()
 
-    is_full_install = (choice == "1")
+    is_full_install = (choice == "2")
 
     DEMO_REQS = [
         "numpy", "h5py", "opencv-python", "opencv-contrib-python",
         "torch", "torchvision", "timm", "einops", "pillow",
-        "scipy", "tqdm", "fastapi", "uvicorn", "python-multipart"
+        "scipy", "tqdm", "fastapi", "uvicorn", "python-multipart", "python-dotenv", "huggingface_hub"
     ]
 
     FULL_REQS = DEMO_REQS + [
@@ -197,14 +209,11 @@ def run_setup():
     print("\n[*] Creating expected directory structures...")
     directories = [
         "demo",
-        "scripts/checkpoints",
-        "scripts/sota_50k_crescent_checkpoints",
-        "scripts/sota_50k_sigma_checkpoints",
+        ".checkpoints",
         "sim",
         "sim2real/output",
         "calibration_data"
     ]
-
     for d in directories:
         os.makedirs(d, exist_ok=True)
         print(f"    [+] {d}/")
@@ -220,42 +229,106 @@ def run_setup():
                 print("    [!] Git not found on system. Please install Git to clone TAPNET.")
         else:
             print("    [✓] TAPNET repository already exists.")
-    else:
-        print("\n[*] Demo Install selected: Skipping TAPNET and training dependencies.")
 
     # --- META V-JEPA BUG PATCH ---
     patch_and_download_vjepa()
 
-    # --- DOWNLOAD CHECKPOINT ---
-    def download_progress(count, block_size, total_size):
-        if total_size > 0:
-            percent = int(count * block_size * 100 / total_size)
-            percent = min(percent, 100)
-            sys.stdout.write(f"\r    Downloading... {percent}%")
-            sys.stdout.flush()
+    # --- HUGGING FACE DOWNLOADS ---
+    # We dynamically import this after pip installation is finished
+    from huggingface_hub import hf_hub_download
 
-    checkpoint_url = "https://huggingface.co/Animesh-null/STATERA/resolve/main/STATERA-50K-Crescent.pth"
-    checkpoint_dest = os.path.join("demo", "STATERA-50K-Crescent.pth")
-
-    print(f"\n[*] Checking SOTA Checkpoint ({checkpoint_dest})...")
-    if not os.path.exists(checkpoint_dest):
-        try:
-            urllib.request.urlretrieve(checkpoint_url, checkpoint_dest, reporthook=download_progress)
-            print("\n    [✓] Download complete.")
-        except Exception as e:
-            print(f"\n    [!] Failed to download checkpoint: {e}")
+    hf_token = get_hf_token()
+    print("\n" + "=" * 70)
+    print("[*] Initiating Hugging Face Downloads")
+    if hf_token:
+        print("    [✓] HF_TOKEN detected in environment/.env. Rate limits bypassed.")
     else:
-        print("[✓] Checkpoint already exists. Skipping download.")
+        print("    [!] No HF_TOKEN detected. If downloading 50GB fails due to rate")
+        print("        limits, add HF_TOKEN=your_token to a .env file and rerun.")
+    print("=" * 70)
+
+    # Models List
+    models_to_download = [
+        ("Animesh-null/STATERA", "STATERA-50K-Crescent.pth"),
+    ]
+
+    if is_full_install:
+        models_to_download.extend([
+            ("Animesh-null/STATERA", "STATERA-50K-Sigma.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-ResNet3D.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-DINOv2.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-VideoMAE.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-No-Z-Depth.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-Frozen-Anchor.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-Anchor.pth"),
+            ("Animesh-null/STATERA", "ablations/STATERA-1K-Standard-Sigma.pth")
+        ])
+
+    print(f"\n[*] Downloading {len(models_to_download)} Checkpoints to '.checkpoints/'...")
+    for repo, filename in models_to_download:
+        print(f"    -> Fetching {os.path.basename(filename)}...")
+        try:
+            downloaded_path = hf_hub_download(
+                repo_id=repo,
+                filename=filename,
+                local_dir=".checkpoints",
+                token=hf_token
+            )
+            if "ablations/" in filename:
+                flat_dest = os.path.join(".checkpoints", os.path.basename(filename))
+                if not os.path.exists(flat_dest):
+                    shutil.move(downloaded_path, flat_dest)
+
+            print(f"       [✓] Success.")
+        except Exception as e:
+            print(f"       [!] Failed: {e}")
+
+    # Dataset Download
+    if is_full_install:
+        print("\n[*] Downloading 50GB Public Test Dataset (This supports resuming)...")
+        try:
+            hf_hub_download(
+                repo_id="Animesh-null/HiddenMass-50K",
+                filename="HiddenMass-50K-Test-Public.hdf5",
+                repo_type="dataset",
+                local_dir=".checkpoints",
+                token=hf_token
+            )
+            print("    [✓] Dataset download complete.")
+        except Exception as e:
+            print(f"    [!] Dataset download failed: {e}")
+
+        print("\n    [i] NOTE: The Training Dataset and combined 1K Ablation datasets")
+        print("        are NOT downloaded by default due to immense size. You can")
+        print("        download them manually from Hugging Face if you wish to train.")
+
+        # Ground Truth JSON Handling
+        gt_src = "HiddenMass-50K-GroundTruth.json"
+        gt_dest = os.path.join(".checkpoints", gt_src)
+        print("\n[*] Checking for Confidential Ground Truth JSON...")
+        if os.path.exists(gt_src):
+            shutil.move(gt_src, gt_dest)
+            print(f"    [✓] Found {gt_src} in root! Safely moved to .checkpoints/")
+        elif not os.path.exists(gt_dest):
+            print("    [!] WARNING: HiddenMass-50K-GroundTruth.json not found!")
+            print("        This file is confidential and NOT publicly available.")
+            print("        Reviewers: Please place the supplementary JSON file in the")
+            print("        root of this repository to run the reproduce tables script.")
+        else:
+            print("    [✓] Ground Truth JSON already present in .checkpoints/")
 
     # --- FINISH ---
     activate_cmd = ".venv\\Scripts\\activate" if os.name == 'nt' else "source .venv/bin/activate"
 
-    print("\n==================================================")
+    print("\n==============================================================================")
     print("[✓] STATERA Setup Complete!")
-    print("==================================================")
-    print(f"To activate your environment and start working, run:")
+    print("==============================================================================")
+    if is_full_install:
+        print("All dependencies, checkpoints, and datasets required to run the")
+        print("`reproduce_paper_tables.py` script have been satisfied.")
+    print("\nTo activate your environment and start working, run:")
     print(f"    {activate_cmd}")
-    print("==================================================\n")
+    print("==============================================================================\n")
 
 
 if __name__ == "__main__":

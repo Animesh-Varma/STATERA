@@ -23,12 +23,13 @@ from statera.model import StateraModel
 
 CHECKPOINTS = {
     "Run-00-Anchor": ".checkpoints/STATERA-1K-Anchor.pth",
-    "Run-04-StaticDot": ".checkpoints/Run-04-Static-Dot.pth",
-    "Run-05-StdSigma": ".checkpoints/Run-05-Standard-Sigma.pth",
-    "Run-01-DINOv2": ".checkpoints/Run-01-DINOv2.pth",
-    "Run-03-ResNet3D": ".checkpoints/Run-03-ResNet3D.pth",
-    "SOTA-Crescent": ".sota_50k_crescent_checkpoints/STATERA-50K-Crescent.pth",
-    "SOTA-Sigma": ".sota_50k_sigma_checkpoints/STATERA-50K-Sigma.pth"
+    "Run-04-StaticDot": ".checkpoints/STATERA-1K-Static-Dot.pth",
+    "Run-05-StdSigma": ".checkpoints/STATERA-1K-Standard-Sigma.pth",
+    "Run-01-DINOv2": ".checkpoints/STATERA-1K-DINOv2.pth",
+    "Run-03-ResNet3D": ".checkpoints/STATERA-1K-ResNet3D.pth",
+    "Run-09-VideoMAE": ".checkpoints/STATERA-1K-VideoMAE.pth",
+    "SOTA-Crescent": ".checkpoints/STATERA-50K-Crescent.pth",
+    "SOTA-Sigma": ".checkpoints/STATERA-50K-Sigma.pth"
 }
 
 
@@ -142,11 +143,8 @@ def run_50k_sota(args):
         print(f"[*] Evaluating Epoch {epoch}/10 on {val_size} validation samples...")
         with torch.no_grad():
             for vids, gt_h, gt_z, gt_coords, bbox_diags in tqdm(val_loader, desc=f"Epoch {epoch}", leave=False):
-                vids = vids.to(device)
-                gt_h = gt_h.to(device)
-                gt_z = gt_z.to(device)
-                gt_coords = gt_coords.to(device)
-                bbox_diags = bbox_diags.to(device)
+                vids, gt_h, gt_z = vids.to(device), gt_h.to(device), gt_z.to(device)
+                gt_coords, bbox_diags = gt_coords.to(device), bbox_diags.to(device)
 
                 pred_h, pred_z = model(vids)
 
@@ -178,42 +176,20 @@ def run_50k_sota(args):
                 total_norm_jitter += norm_jitter_batch.mean().item()
 
         avg_val_h = val_h / len(val_loader)
-        avg_val_z = val_z / len(val_loader)
         avg_px_err = total_px_err / len(val_loader)
         avg_jitter = total_jitter_err / len(val_loader)
         avg_n_come = total_n_come / len(val_loader)
         avg_norm_jitter = total_norm_jitter / len(val_loader)
         h_ke = (2 * avg_n_come * avg_norm_jitter) / (avg_n_come + avg_norm_jitter + 1e-8)
 
-        cat_errors = torch.cat(all_batch_errors, dim=0)
-        p95_px_err = torch.quantile(cat_errors.float(), 0.95).item()
-
-        print(
-            f"[✓] Epoch {epoch} Results | Loss: {avg_val_h:.4f} | N-CoME: {avg_n_come * 100:.2f}% | H_KE: {h_ke:.4f} | PX Err: {avg_px_err:.2f}px")
-
         wandb.log({
             "val/heatmap_loss": avg_val_h,
-            "val/z_loss": avg_val_z,
             "metrics/pixel_error": avg_px_err,
-            "metrics/p95_error": p95_px_err,
             "metrics/kinematic_jitter": avg_jitter,
             "metrics/N-CoME": avg_n_come,
             "metrics/H_KE": h_ke,
         }, step=epoch)
 
-        metrics_history[f"Epoch_{epoch}"] = {
-            "val_heatmap_loss": avg_val_h,
-            "val_z_loss": avg_val_z,
-            "val_pixel_error": avg_px_err,
-            "val_p95_error": p95_px_err,
-            "val_kinematic_jitter": avg_jitter,
-            "val_n_come": avg_n_come,
-            "val_h_ke": h_ke
-        }
-
-    with open(args.metrics_file, 'w') as f:
-        json.dump(metrics_history, f, indent=4)
-    print(f"\n[✓] Retrospective Evaluation Complete! Data saved to {args.metrics_file} and W&B.")
     wandb.finish()
 
 
@@ -569,55 +545,66 @@ def extract_bbox_diags(rvecs, tvecs, mtx, dist, box_size_m, scale):
          [-hx, hy, hz]], dtype=np.float32)
     diags = []
     for i in range(16):
-        rv, tv = rvecs[i], tvecs[i]
-        pts2d, _ = cv2.projectPoints(box_3d, rv, tv, mtx, dist)
+        pts2d, _ = cv2.projectPoints(box_3d, rvecs[i], tvecs[i], mtx, dist)
         pts2d = pts2d.reshape(-1, 2)
-        w = np.max(pts2d[:, 0]) - np.min(pts2d[:, 0])
-        h = np.max(pts2d[:, 1]) - np.min(pts2d[:, 1])
-        diag_orig = np.sqrt(w ** 2 + h ** 2)
-        diags.append(diag_orig * scale)
+        w, h = np.max(pts2d[:, 0]) - np.min(pts2d[:, 0]), np.max(pts2d[:, 1]) - np.min(pts2d[:, 1])
+        diags.append(np.sqrt(w ** 2 + h ** 2) * scale)
     return np.array(diags, dtype=np.float32)
+
+def extract_gc_coords(rvecs, tvecs, mtx, dist, scale, gt_coords, hidden_com_m):
+    gc_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+    com_3d = np.array([hidden_com_m], dtype=np.float32)
+    gc_coords = []
+    for i in range(16):
+        proj_gc, _ = cv2.projectPoints(gc_3d, rvecs[i], tvecs[i], mtx, dist)
+        proj_com, _ = cv2.projectPoints(com_3d, rvecs[i], tvecs[i], mtx, dist)
+        vec_2d = (proj_com[0][0] - proj_gc[0][0]) * scale
+        gc_coords.append(gt_coords[i] - vec_2d)
+    return np.array(gc_coords, dtype=np.float32)
 
 
 def load_real_world_data(data_dir, cam_mtx_path, dist_coeffs_path):
-    print("[*] Linking Real-World Dataset & Computing BBox Diagonals...")
+    print("[*] Linking Real-World Dataset & Computing Kinetics...")
     mtx = np.load(cam_mtx_path)
     dist = np.load(dist_coeffs_path)
-    cx_guess, cy_guess = mtx[0, 2] * 2, mtx[1, 2] * 2
-    frame_w, frame_h = snap_res(cx_guess), snap_res(cy_guess)
-    scale = 384.0 / min(frame_w, frame_h)
+    cx_guess = mtx[0, 2] * 2
+    scale = 384.0 / snap_res(cx_guess)
     samples = []
     h5_files = sorted(glob.glob(os.path.join(data_dir, '*_statera.h5')))
     for f_path in h5_files:
         with h5py.File(f_path, 'r') as f:
             box_size_m = f.attrs["box_size_m"]
+            hidden_com_m = f.attrs["hidden_com_m"]
             for group_name in f.keys():
                 if not group_name.startswith('seq_'): continue
                 grp = f[group_name]
-                frames_bgr = grp["frames"][:]
-                frames_rgb = frames_bgr[:, :, :, ::-1].copy()
+                frames_rgb = grp["frames"][:][:, :, :, ::-1].copy()
                 gt_coords = np.stack([grp["com_u"][:], grp["com_v"][:]], axis=1)
                 diags = extract_bbox_diags(grp["rvecs"][:], grp["tvecs"][:], mtx, dist, box_size_m, scale)
-                samples.append({
-                    'frames': frames_rgb,
-                    'gt_coords': gt_coords,
-                    'diags': diags
-                })
+                gc_coords = extract_gc_coords(grp["rvecs"][:], grp["tvecs"][:], mtx, dist, scale, gt_coords,
+                                              hidden_com_m)
+                samples.append({'frames': frames_rgb, 'gt_coords': gt_coords, 'diags': diags, 'gc_coords': gc_coords})
     print(f"[✓] Loaded {len(samples)} Physical Sequences.")
     return samples
 
 
-def calculate_sequence_metrics(pred_coords, gt_coords, bbox_diags):
+def calculate_sequence_metrics(pred_coords, gt_coords, bbox_diags, gc_coords):
     px_errors = torch.norm(pred_coords - gt_coords, dim=1)
     n_come = (px_errors / bbox_diags).mean().item()
-    pred_vel = pred_coords[1:] - pred_coords[:-1]
-    gt_vel = gt_coords[1:] - gt_coords[:-1]
-    pred_accel = pred_vel[1:] - pred_vel[:-1]
-    gt_accel = gt_vel[1:] - gt_vel[:-1]
+    pred_vel, gt_vel = pred_coords[1:] - pred_coords[:-1], gt_coords[1:] - gt_coords[:-1]
+    pred_accel, gt_accel = pred_vel[1:] - pred_vel[:-1], gt_vel[1:] - gt_vel[:-1]
+
     accel_errors = torch.norm(pred_accel - gt_accel, dim=1)
     norm_jitter = (accel_errors / bbox_diags[2:]).mean().item()
     raw_jitter = accel_errors.mean().item()
-    return n_come, norm_jitter, raw_jitter
+
+    v_true = gt_coords - gc_coords
+    v_pred = pred_coords - gc_coords
+    dot_product = (v_pred * v_true).sum(dim=1)
+    true_mag_sq = (v_true * v_true).sum(dim=1) + 1e-8
+    phys_cap = (dot_product / true_mag_sq).mean().item()  # Not clamped, deliberately captures catastrophe
+
+    return n_come, norm_jitter, raw_jitter, phys_cap
 
 
 def run_cotracker(samples, device):
@@ -629,107 +616,127 @@ def run_cotracker(samples, device):
         print(f"[!] CoTracker failed to load.\n{e}")
         return None
 
-    queries = torch.tensor([[[0.0, 192.0, 192.0]]]).to(device)
-    tot_ncome, tot_njitter, tot_rawjitter = 0.0, 0.0, 0.0
+    grid_x, grid_y = torch.meshgrid(torch.linspace(142, 242, 10), torch.linspace(142, 242, 10), indexing='xy')
+    queries = torch.zeros(1, 100, 3).to(device)
+    queries[0, :, 0] = 0.0  # t
+    queries[0, :, 1] = grid_x.flatten()  # x
+    queries[0, :, 2] = grid_y.flatten()  # y
+
+    tot_ncome, tot_njitter, tot_rawjitter, tot_physcap = 0.0, 0.0, 0.0, 0.0
     with torch.no_grad():
         for seq in tqdm(samples, desc="Evaluating CoTracker"):
-            video = torch.from_numpy(seq['frames']).float().to(device)
-            video = video.permute(0, 3, 1, 2).unsqueeze(0)
-            pred_tracks, _ = model(video, queries=queries)
-            pred_coords = pred_tracks[0, :, 0, :]
+            video = torch.from_numpy(seq['frames']).float().to(device).permute(0, 3, 1, 2).unsqueeze(0)
+            pred_tracks, pred_vis = model(video, queries=queries)
+            tracks, vis = pred_tracks[0], pred_vis[0] > 0.8
+
+            seq_pred = []
+            for f in range(16):
+                v = vis[f]
+                if v.sum() > 0:
+                    seq_pred.append(tracks[f, v, :].mean(dim=0))
+                else:
+                    seq_pred.append(seq_pred[-1] if len(seq_pred) > 0 else torch.tensor([192.0, 192.0]).to(device))
+            pred_coords = torch.stack(seq_pred)
+
             gt_coords = torch.from_numpy(seq['gt_coords']).float().to(device)
             diags = torch.from_numpy(seq['diags']).float().to(device)
-            n_come, norm_jitt, raw_jitt = calculate_sequence_metrics(pred_coords, gt_coords, diags)
-            tot_ncome += n_come
-            tot_njitter += norm_jitt
-            tot_rawjitter += raw_jitt
+            gc_coords = torch.from_numpy(seq['gc_coords']).float().to(device)
+
+            n_come, norm_jitt, raw_jitt, phys_cap = calculate_sequence_metrics(pred_coords, gt_coords, diags, gc_coords)
+            tot_ncome += n_come;
+            tot_njitter += norm_jitt;
+            tot_rawjitter += raw_jitt;
+            tot_physcap += phys_cap
 
     n = len(samples)
-    avg_ncome = tot_ncome / n
-    avg_njitter = tot_njitter / n
-    avg_rawjitter = tot_rawjitter / n
+    avg_ncome, avg_njitter, avg_rawjitter, avg_physcap = tot_ncome / n, tot_njitter / n, tot_rawjitter / n, tot_physcap / n
     h_ke = (2 * avg_ncome * avg_njitter) / (avg_ncome + avg_njitter + 1e-8)
 
     wandb.init(project="STATERA", name="Baseline-CoTracker-RealWorld")
-    wandb.log({"real_world/N-CoME": avg_ncome, "real_world/Raw_Jitter": avg_rawjitter, "real_world/H_KE": h_ke})
+    wandb.log({"real_world/N-CoME": avg_ncome, "real_world/H_KE": h_ke, "real_world/Phys_Capture": avg_physcap})
     wandb.finish()
-    return {'n_come': avg_ncome, 'raw_jitter': avg_rawjitter, 'h_ke': h_ke}
+    return {'n_come': avg_ncome, 'raw_jitter': avg_rawjitter, 'h_ke': h_ke, 'phys_cap': avg_physcap}
 
 
 def run_tapir(samples, device):
     print("\n[*] Initializing Google's TAPIR...")
     repo_dir = os.path.abspath("tapnet_repo")
-    if not os.path.exists(repo_dir):
-        subprocess.run(["git", "clone", "https://github.com/deepmind/tapnet.git", repo_dir])
-    if repo_dir not in sys.path:
-        sys.path.insert(0, repo_dir)
-    try:
-        from tapnet.torch import tapir_model
-    except Exception as e:
-        print(f"[!] TAPIR module import failed: {e}")
-        return None
+    if not os.path.exists(repo_dir): subprocess.run(
+        ["git", "clone", "https://github.com/deepmind/tapnet.git", repo_dir])
+    if repo_dir not in sys.path: sys.path.insert(0, repo_dir)
+    from tapnet.torch import tapir_model
     ckpt_path = "bootstapir_checkpoint_v2.pt"
     if not os.path.exists(ckpt_path):
-        url = "https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt"
-        urllib.request.urlretrieve(url, ckpt_path)
-    try:
-        model = tapir_model.TAPIR(pyramid_level=1)
-        model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        model.to(device)
-        model.eval()
-    except Exception as e:
-        print(f"[!] Failed to load TAPIR weights: {e}")
-        return None
+        urllib.request.urlretrieve("https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt",
+                                   ckpt_path)
 
-    queries = torch.tensor([[[0.0, 192.0, 192.0]]]).to(device)
-    tot_ncome, tot_njitter, tot_rawjitter = 0.0, 0.0, 0.0
+    model = tapir_model.TAPIR(pyramid_level=1)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.to(device).eval()
+
+    grid_x, grid_y = torch.meshgrid(torch.linspace(142, 242, 10), torch.linspace(142, 242, 10), indexing='xy')
+    queries = torch.zeros(1, 100, 3).to(device)
+    queries[0, :, 0] = 0.0  # t
+    queries[0, :, 1] = grid_y.flatten()  # y (TAPIR requires t,y,x)
+    queries[0, :, 2] = grid_x.flatten()  # x
+
+    tot_ncome, tot_njitter, tot_rawjitter, tot_physcap = 0.0, 0.0, 0.0, 0.0
     with torch.no_grad():
         for seq in tqdm(samples, desc="Evaluating TAPIR"):
-            video = torch.from_numpy(seq['frames']).float().to(device) / 255.0
-            video = video.unsqueeze(0)
-            video_tapir = (video * 2.0) - 1.0
+            video_tapir = ((torch.from_numpy(seq['frames']).float().to(device) / 255.0).unsqueeze(0) * 2.0) - 1.0
             outputs = model(video_tapir, query_points=queries, is_training=False)
-            tracks = outputs['tracks']
-            pred_coords = tracks[0, 0, :, :]
+            tracks, vis = outputs['tracks'][0], (outputs['occlusion'][0] < 0)
+
+            seq_pred = []
+            for f in range(16):
+                v = vis[:, f]
+                if v.sum() > 0:
+                    seq_pred.append(tracks[v, f, :].mean(dim=0))
+                else:
+                    seq_pred.append(seq_pred[-1] if len(seq_pred) > 0 else torch.tensor([192.0, 192.0]).to(device))
+            pred_coords = torch.stack(seq_pred)
+
             gt_coords = torch.from_numpy(seq['gt_coords']).float().to(device)
             diags = torch.from_numpy(seq['diags']).float().to(device)
-            n_come, norm_jitt, raw_jitt = calculate_sequence_metrics(pred_coords, gt_coords, diags)
-            tot_ncome += n_come
-            tot_njitter += norm_jitt
-            tot_rawjitter += raw_jitt
+            gc_coords = torch.from_numpy(seq['gc_coords']).float().to(device)
+
+            n_come, norm_jitt, raw_jitt, phys_cap = calculate_sequence_metrics(pred_coords, gt_coords, diags, gc_coords)
+            tot_ncome += n_come;
+            tot_njitter += norm_jitt;
+            tot_rawjitter += raw_jitt;
+            tot_physcap += phys_cap
+
     n = len(samples)
-    avg_ncome = tot_ncome / n
-    avg_njitter = tot_njitter / n
-    avg_rawjitter = tot_rawjitter / n
+    avg_ncome, avg_njitter, avg_rawjitter, avg_physcap = tot_ncome / n, tot_njitter / n, tot_rawjitter / n, tot_physcap / n
     h_ke = (2 * avg_ncome * avg_njitter) / (avg_ncome + avg_njitter + 1e-8)
+
     wandb.init(project="STATERA", name="Baseline-TAPIR-RealWorld")
-    wandb.log({"real_world/N-CoME": avg_ncome, "real_world/Raw_Jitter": avg_rawjitter, "real_world/H_KE": h_ke})
+    wandb.log({"real_world/N-CoME": avg_ncome, "real_world/H_KE": h_ke, "real_world/Phys_Capture": avg_physcap})
     wandb.finish()
-    return {'n_come': avg_ncome, 'raw_jitter': avg_rawjitter, 'h_ke': h_ke}
+    return {'n_come': avg_ncome, 'raw_jitter': avg_rawjitter, 'h_ke': h_ke, 'phys_cap': avg_physcap}
 
 
 def print_summary_table(results):
-    print("\n" + "=" * 90)
-    print(f"{'POINT TRACKER BASELINES (Sim2Real Physical Verification)':^90}")
-    print("=" * 90)
-    print(f"| {'Model Name':^26} | {'N-CoME (%)':^16} | {'Raw Jitter':^16} | {'H_KE Metric':^16} |")
-    print("-" * 90)
-    for name, metrics in results.items():
-        if metrics is None:
-            print(f"| {name:<26} | {'FAILED':^16} | {'FAILED':^16} | {'FAILED':^16} |")
+    print("\n" + "=" * 105)
+    print(f"{'POINT TRACKER BASELINES (Dynamic Surface Centroid Evaluation)':^105}")
+    print("=" * 105)
+    print(
+        f"| {'Model Name':^26} | {'N-CoME (%)':^16} | {'Raw Jitter':^16} | {'H_KE Metric':^16} | {'Phys. Capture':^16} |")
+    print("-" * 105)
+    for name, m in results.items():
+        if m is None:
+            print(f"| {name:<26} | {'FAILED':^16} | {'FAILED':^16} | {'FAILED':^16} | {'FAILED':^16} |")
         else:
             print(
-                f"| {name:<26} | {metrics['n_come'] * 100:^15.2f}% | {metrics['raw_jitter']:^16.3f} | {metrics['h_ke']:^16.5f} |")
-    print("=" * 90 + "\n")
+                f"| {name:<26} | {m['n_come'] * 100:^15.2f}% | {m['raw_jitter']:^16.3f} | {m['h_ke']:^16.5f} | {m['phys_cap'] * 100:^15.2f}% |")
+    print("=" * 105 + "\n")
 
 
 def run_point_trackers(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     samples = load_real_world_data(args.data_dir, args.mtx_path, args.dist_path)
     if not samples: return
-    results = {}
-    results["Meta CoTracker2"] = run_cotracker(samples, device)
-    results["Google TAPIR"] = run_tapir(samples, device)
+    results = {"Meta CoTracker2": run_cotracker(samples, device), "Google TAPIR": run_tapir(samples, device)}
     print_summary_table(results)
 
 
@@ -859,8 +866,7 @@ def get_args():
         'geom_collapse', 'point_trackers', 'real_world', 'sim_50k', 'all'],
                         help='Task to run or "all" to run sequentially')
     parser.add_argument('--dataset_path', type=str, default='sim/HiddenMass-50K.hdf5')
-    parser.add_argument('--checkpoint_dir', type=str,
-                        default='scripts/sota_50k_crescent_checkpoints')
+    parser.add_argument('--checkpoint_dir', type=str, default='scripts/sota_50k_crescent_checkpoints')
     parser.add_argument('--run_name', type=str, default='STATERA-50K-Crescent-SOTA')
     parser.add_argument('--batch_size', type=int, default=24)
     parser.add_argument('--temperature', type=float, default=2.0)
@@ -874,17 +880,10 @@ def get_args():
 def main():
     args = get_args()
     tasks = {
-        '50k_sota': run_50k_sota,
-        'centroid': run_centroid,
-        'dispersion': run_dispersion,
-        'entropy': run_entropy,
-        'euclidean': run_euclidean,
-        'geom_collapse': run_geom_collapse,
-        'point_trackers': run_point_trackers,
-        'real_world': run_real_world,
-        'sim_50k': run_sim_50k
+        '50k_sota': run_50k_sota, 'centroid': run_centroid, 'dispersion': run_dispersion,
+        'entropy': run_entropy, 'euclidean': run_euclidean, 'geom_collapse': run_geom_collapse,
+        'point_trackers': run_point_trackers, 'real_world': run_real_world, 'sim_50k': run_sim_50k
     }
-
     if args.task == 'all':
         for task_name, task_func in tasks.items():
             print(f"\n[{'*' * 10} RUNNING TASK: {task_name.upper()} {'*' * 10}]\n")
@@ -893,5 +892,4 @@ def main():
         tasks[args.task](args)
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()

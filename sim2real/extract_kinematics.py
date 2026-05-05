@@ -230,7 +230,6 @@ def process_directory():
                 _, r_anch, t_anch = cv2.solvePnP(raw_buffer[anchor_idx]['obj_pts'], raw_buffer[anchor_idx]['img_pts'], mtx, dist, flags=cv2.SOLVEPNP_SQPNP)
                 poses[anchor_idx] = (r_anch, t_anch)
 
-                # Track Forwards (REMOVED SQPNP DRIFT RESET TO PREVENT SNAP-RINGING)
                 for i in range(anchor_idx + 1, total_extract_len):
                     guess_r, guess_t = poses[i-1][0].copy(), poses[i-1][1].copy()
                     _, r, t = cv2.solvePnP(raw_buffer[i]['obj_pts'], raw_buffer[i]['img_pts'], mtx, dist,

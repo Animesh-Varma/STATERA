@@ -73,7 +73,6 @@ def extract_random_spread_frames(video_path, output_dir, num_frames=100):
     target_frames = min(num_frames, total_frames)
     segment_size = total_frames // target_frames
 
-    # Calculate random frame indices spread across the video
     frame_indices =[]
     for i in range(target_frames):
         start_idx = i * segment_size
@@ -90,11 +89,9 @@ def extract_random_spread_frames(video_path, output_dir, num_frames=100):
         ret, frame = cap.read()
         if ret:
             out_path = os.path.join(output_dir, f"calib_frame_{saved_count:03d}.jpg")
-            # Save at 100% quality to avoid AI compression artifacts on the corners
             cv2.imwrite(out_path, frame,[int(cv2.IMWRITE_JPEG_QUALITY), 100])
             saved_count += 1
 
-        # Terminal loading bar
         if saved_count % 10 == 0:
             print(f"   -> Extracted {saved_count}/{target_frames} frames")
 
@@ -106,32 +103,26 @@ def calibrate_camera(output_dir: str = "."):
     print(" STATERA: Camera Calibration & Frame Extraction")
     print("="*70)
 
-    # Variables
     dpi = get_var('dpi', 'Printer DPI', int, 300)
     calib_input = get_var('calib_input', 'Calibration source (Video file OR Folder path)', str, 'calibration_video.mp4')
     chk_cols = get_var('checkerboard_cols', 'Checkerboard internal corners X', int, 9)
     chk_rows = get_var('checkerboard_rows', 'Checkerboard internal corners Y', int, 6)
     sq_size_cm = get_var('square_size_cm', 'Checkerboard square size in cm', float, 2.5)
 
-    # Generate the physical PDF in case they haven't printed it yet
     pdf_file = generate_checkerboard_pdf(chk_cols, chk_rows, sq_size_cm, dpi)
     print(f"[INFO] Reference checkerboard generated -> '{pdf_file}'")
 
     working_dir = "calibration_data"
 
-    # Auto-Extraction Logic
     if calib_input.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         if not os.path.exists(calib_input):
             print(f"\n[!] ERROR: Could not find video '{calib_input}'. Did you run ffmpeg?")
             sys.exit(1)
 
-        # Extract 100 frames automatically
         extract_random_spread_frames(calib_input, working_dir, num_frames=100)
     else:
-        # User provided a folder of images directly
         working_dir = calib_input
 
-    # Load images for calibration
     images = glob.glob(os.path.join(working_dir, '*.jpg')) + glob.glob(os.path.join(working_dir, '*.png'))
 
     if not images:
@@ -142,7 +133,7 @@ def calibrate_camera(output_dir: str = "."):
 
     # --- CALIBRATION MATH ---
     checkerboard_size = (chk_cols, chk_rows)
-    square_size_m = sq_size_cm / 100.0  # Meters for absolute 3D projection
+    square_size_m = sq_size_cm / 100.0
 
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
@@ -162,12 +153,10 @@ def calibrate_camera(output_dir: str = "."):
         if gray_shape is None:
             gray_shape = gray.shape[::-1]
 
-        # Search for the checkerboard
         ret, corners = cv2.findChessboardCorners(gray, checkerboard_size, None)
 
         if ret:
             objpoints.append(objp)
-            # Mathematical sub-pixel optimization
             corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
             imgpoints.append(corners2)
             successful_frames += 1
@@ -181,7 +170,6 @@ def calibrate_camera(output_dir: str = "."):
     print(f"[INFO] Successfully locked geometry in {successful_frames} frames. Calculating Matrix...")
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray_shape, None, None)
 
-    # Evaluate Reprojection Integrity
     mean_error = 0
     for i in range(len(objpoints)):
         imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], mtx, dist)

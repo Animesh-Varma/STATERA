@@ -24,10 +24,13 @@ class StateraModel(nn.Module):
             hub_out = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
             self.backbone = hub_out[0] if isinstance(hub_out, tuple) else hub_out
             self.embed_dim = 1024
+        elif self.backbone_type == 'videomae':
+            from transformers import VideoMAEModel
+            self.backbone = VideoMAEModel.from_pretrained('MCG-NJU/videomae-large')
+            self.embed_dim = 1024
         elif self.backbone_type == 'resnet3d':
             from torchvision.models.video import r3d_18, R3D_18_Weights
             self.backbone = r3d_18(weights=R3D_18_Weights.DEFAULT)
-            # Remove the AdaptiveAvgPool3d and FC layer to preserve spatial map
             self.backbone = nn.Sequential(*list(self.backbone.children())[:-2])
             self.embed_dim = 512
 
@@ -103,6 +106,27 @@ class StateraModel(nn.Module):
             tokens = tokens.reshape(B, 8, 576, self.embed_dim)
             T_current = 8
 
+
+        elif self.backbone_type == 'videomae':
+            B, C, T_in, H, W = x.shape
+            x_res = x.permute(0, 2, 1, 3, 4).reshape(B * T_in, C, H, W)
+            x_res = F.interpolate(x_res, size=(224, 224), mode='bilinear')
+
+            mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+            x_res = (x_res - mean) / std
+
+            x_res = x_res.reshape(B, T_in, C, 224, 224)
+
+            with torch.set_grad_enabled(enable_grad):
+                tokens = self.backbone(pixel_values=x_res).last_hidden_state
+
+            tokens = tokens.reshape(B * 8, 196, self.embed_dim).permute(0, 2, 1).reshape(B * 8, self.embed_dim, 14, 14)
+
+            tokens = F.interpolate(tokens, size=(24, 24), mode='bilinear')
+            tokens = tokens.reshape(B, 8, self.embed_dim, 576).permute(0, 1, 3, 2)
+            T_current = 8
+
         elif self.backbone_type == 'dinov2':
             if len(x.shape) == 5 and x.shape[1] == 3 and x.shape[2] == 16:
                 x_inter = x.permute(0, 2, 1, 3, 4).reshape(B * 16, 3, 384, 384)
@@ -128,11 +152,8 @@ class StateraModel(nn.Module):
         elif self.backbone_type == 'resnet3d':
             x_inter = x
             with torch.set_grad_enabled(enable_grad):
-                out = self.backbone(x_inter)  # Shape: B, 512, 2, 24, 24
-
+                out = self.backbone(x_inter)
             out = F.interpolate(out, size=(16, 24, 24), mode='trilinear', align_corners=False)
-
-            # Format to [B, T, SpatialPatches, C]
             tokens = out.permute(0, 2, 1, 3, 4).reshape(B, 16, self.embed_dim, 576).permute(0, 1, 3, 2)
             T_current = 16
 

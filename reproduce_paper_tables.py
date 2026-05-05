@@ -17,31 +17,39 @@ GT_JSON_PATH = ".checkpoints/HiddenMass-50K-GroundTruth.json"
 CHECKPOINTS = {
     "Standard 3D-CNN (ResNet3D)": {
         "path": ".checkpoints/STATERA-1K-ResNet3D.pth",
-        "backbone": "resnet3d"
+        "backbone": "resnet3d", "single_task": False
     },
     "Spatial Foundation (DINOv2)": {
         "path": ".checkpoints/STATERA-1K-DINOv2.pth",
-        "backbone": "dinov2"
+        "backbone": "dinov2", "single_task": False
+    },
+    "Temporal Foundation (VideoMAE v2)": {
+        "path": ".checkpoints/STATERA-1K-VideoMAE.pth",
+        "backbone": "videomae", "single_task": False
+    },
+    "STATERA-1K-No-Z-Depth (Paradox Ablation)": {
+        "path": ".checkpoints/STATERA-1K-No-Z-Depth.pth",
+        "backbone": "vjepa", "single_task": True
     },
     "STATERA-1K-Frozen-Anchor": {
         "path": ".checkpoints/STATERA-1K-Frozen-Anchor.pth",
-        "backbone": "vjepa"
+        "backbone": "vjepa", "single_task": False
     },
     "STATERA-1K-Anchor": {
         "path": ".checkpoints/STATERA-1K-Anchor.pth",
-        "backbone": "vjepa"
+        "backbone": "vjepa", "single_task": False
     },
     "STATERA-1K-Standard-Sigma": {
-        "path": ".checkpoints/STATERA-1K-Standard-Sigma.pth",
-        "backbone": "vjepa"
+        "path": ".checkpoints/Run-05-Standard-Sigma-Saved.pth",
+        "backbone": "vjepa", "single_task": False
     },
     "STATERA-50K-Crescent (Phase-Aware)": {
         "path": ".checkpoints/STATERA-50K-Crescent.pth",
-        "backbone": "vjepa"
+        "backbone": "vjepa", "single_task": False
     },
     "STATERA-50K-Sigma (Phase-Agnostic)": {
         "path": ".checkpoints/STATERA-50K-Sigma.pth",
-        "backbone": "vjepa"
+        "backbone": "vjepa", "single_task": False
     }
 }
 
@@ -104,17 +112,21 @@ def evaluate_models(device):
     print("[*] Evaluating Geometric Centroid (Naive Physics)...")
     centroid_pred = torch.tensor([192.0, 192.0]).to(device).expand(16, 2)
 
-    c_sim_n, c_sim_j, c_sim_k = [], [],[]
+    c_sim_n, c_sim_j, c_sim_k = [], [], []
     for idx in sim_indices:
         n, jitt, k = compute_metrics(centroid_pred, all_gt_uv[idx], all_diags[idx])
-        c_sim_n.append(n); c_sim_j.append(jitt); c_sim_k.append(k)
+        c_sim_n.append(n);
+        c_sim_j.append(jitt);
+        c_sim_k.append(k)
     sim_results["Geometric Centroid (Naive Physics)"] = {"n_come": np.mean(c_sim_n), "jitter": np.mean(c_sim_j),
                                                          "kecs": np.mean(c_sim_k)}
 
-    c_real_n, c_real_j, c_real_k = [], [],[]
+    c_real_n, c_real_j, c_real_k = [], [], []
     for idx in real_indices:
         n, jitt, k = compute_metrics(centroid_pred, all_gt_uv[idx], all_diags[idx])
-        c_real_n.append(n); c_real_j.append(jitt); c_real_k.append(k)
+        c_real_n.append(n);
+        c_real_j.append(jitt);
+        c_real_k.append(k)
     real_results["Geometric Centroid (Naive Physics)"] = {"n_come": np.mean(c_real_n), "jitter": np.mean(c_real_j),
                                                           "kecs": np.mean(c_real_k), "phys_cap": 0.0}
 
@@ -126,12 +138,12 @@ def evaluate_models(device):
 
         print(f"[*] Evaluating {name}...")
         model = StateraModel(decoder_type='deconv', temporal_mixer='conv1d', backbone_type=cfg['backbone'],
-                             scratch=False).to(device)
+                             single_task=cfg['single_task'], scratch=False).to(device)
         model.load_state_dict(torch.load(cfg['path'], map_location=device, weights_only=True))
         model.eval()
 
-        m_sim_n, m_sim_j, m_sim_k = [], [],[]
-        m_real_n, m_real_j, m_real_k, m_phys = [], [], [],[]
+        m_sim_n, m_sim_j, m_sim_k = [], [], []
+        m_real_n, m_real_j, m_real_k, m_phys = [], [], [], []
 
         with torch.no_grad(), h5py.File(PUBLIC_TEST_PATH, 'r') as f:
             total_seq = len(labels)
@@ -154,9 +166,13 @@ def evaluate_models(device):
                     n, jitt, k = compute_metrics(pred, gt, diag)
 
                     if global_idx in sim_indices:
-                        m_sim_n.append(n); m_sim_j.append(jitt); m_sim_k.append(k)
+                        m_sim_n.append(n);
+                        m_sim_j.append(jitt);
+                        m_sim_k.append(k)
                     else:
-                        m_real_n.append(n); m_real_j.append(jitt); m_real_k.append(k)
+                        m_real_n.append(n);
+                        m_real_j.append(jitt);
+                        m_real_k.append(k)
 
                         # Physics Capture Ratio
                         gc_coord = all_gc_uv[global_idx]
@@ -172,7 +188,113 @@ def evaluate_models(device):
         real_results[name] = {"n_come": np.mean(m_real_n), "jitter": np.mean(m_real_j), "kecs": np.mean(m_real_k),
                               "phys_cap": np.mean(m_phys)}
 
-        del model; gc.collect(); torch.cuda.empty_cache()
+        del model;
+        gc.collect();
+        torch.cuda.empty_cache()
+
+    # 3. Dynamic Surface Centroid Trackers (CoTracker & TAPIR)
+    print("\n[*] Evaluating Dynamic Surface Centroid Point Trackers on Real-World Data...")
+
+    grid_x, grid_y = torch.meshgrid(torch.linspace(142, 242, 10), torch.linspace(142, 242, 10), indexing='xy')
+
+    try:
+        print("[>] Loading Meta CoTracker2...")
+        cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker2").to(device).eval()
+        queries = torch.zeros(1, 100, 3).to(device)  # t, x, y
+        queries[0, :, 1], queries[0, :, 2] = grid_x.flatten(), grid_y.flatten()
+
+        m_n, m_j, m_k, m_phys = [], [], [], []
+        with torch.no_grad(), h5py.File(PUBLIC_TEST_PATH, 'r') as f:
+            for idx in tqdm(real_indices, desc="CoTracker Inference", leave=False):
+                vids = torch.from_numpy(f['videos'][idx:idx + 1]).float().to(device)
+                pred_tracks, pred_vis = cotracker(vids, queries=queries)
+                tracks, vis = pred_tracks[0], pred_vis[0] > 0.8
+
+                seq_pred = []
+                for f_idx in range(16):
+                    v = vis[f_idx]
+                    seq_pred.append(
+                        tracks[f_idx, v, :].mean(dim=0) if v.sum() > 0 else torch.tensor([192.0, 192.0]).to(device))
+                pred = torch.stack(seq_pred)
+
+                gt, diag, gc_coord = all_gt_uv[idx], all_diags[idx], all_gc_uv[idx]
+                n, jitt, k = compute_metrics(pred, gt, diag)
+
+                # EXACT Original Physics Capture Ratio
+                v_true = gt - gc_coord
+                v_pred = pred - gc_coord
+                dot_product = (v_pred * v_true).sum(dim=1)
+                true_mag_sq = (v_true * v_true).sum(dim=1) + 1e-8
+                ratio = (dot_product / true_mag_sq).mean().item()
+
+                m_n.append(n);
+                m_j.append(jitt);
+                m_k.append(k);
+                m_phys.append(ratio)
+
+        real_results["Point Tracker (CoTracker2)"] = {"n_come": np.mean(m_n), "jitter": np.mean(m_j),
+                                                      "kecs": np.mean(m_k), "phys_cap": np.mean(m_phys)}
+        del cotracker;
+        gc.collect();
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"[!] CoTracker evaluation failed: {e}")
+
+    try:
+        print("[>] Loading Google TAPIR...")
+        import urllib.request, subprocess
+        repo_dir = os.path.abspath("tapnet_repo")
+        if not os.path.exists(repo_dir): subprocess.run(
+            ["git", "clone", "https://github.com/deepmind/tapnet.git", repo_dir])
+        if repo_dir not in sys.path: sys.path.insert(0, repo_dir)
+        from tapnet.torch import tapir_model
+
+        ckpt_path = "bootstapir_checkpoint_v2.pt"
+        if not os.path.exists(ckpt_path): urllib.request.urlretrieve(
+            "https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt", ckpt_path)
+
+        tapir = tapir_model.TAPIR(pyramid_level=1)
+        tapir.load_state_dict(torch.load(ckpt_path, map_location=device))
+        tapir.to(device).eval()
+
+        queries = torch.zeros(1, 100, 3).to(device)  # t, y, x
+        queries[0, :, 1], queries[0, :, 2] = grid_y.flatten(), grid_x.flatten()
+
+        m_n, m_j, m_k, m_phys = [], [], [], []
+        with torch.no_grad(), h5py.File(PUBLIC_TEST_PATH, 'r') as f:
+            for idx in tqdm(real_indices, desc="TAPIR Inference", leave=False):
+                vids_tapir = ((torch.from_numpy(f['videos'][idx:idx + 1]).float().to(device) / 255.0) * 2.0) - 1.0
+                outputs = tapir(vids_tapir, query_points=queries, is_training=False)
+                tracks, vis = outputs['tracks'][0], ~(outputs['occluded'][0])
+
+                seq_pred = []
+                for f_idx in range(16):
+                    v = vis[:, f_idx]
+                    seq_pred.append(
+                        tracks[v, f_idx, :].mean(dim=0) if v.sum() > 0 else torch.tensor([192.0, 192.0]).to(device))
+                pred = torch.stack(seq_pred)
+
+                gt, diag, gc_coord = all_gt_uv[idx], all_diags[idx], all_gc_uv[idx]
+                n, jitt, k = compute_metrics(pred, gt, diag)
+
+                v_true = gt - gc_coord
+                v_pred = pred - gc_coord
+                dot_product = (v_pred * v_true).sum(dim=1)
+                true_mag_sq = (v_true * v_true).sum(dim=1) + 1e-8
+                ratio = (dot_product / true_mag_sq).mean().item()
+
+                m_n.append(n);
+                m_j.append(jitt);
+                m_k.append(k);
+                m_phys.append(ratio)
+
+        real_results["Point Tracker (TAPIR)"] = {"n_come": np.mean(m_n), "jitter": np.mean(m_j), "kecs": np.mean(m_k),
+                                                 "phys_cap": np.mean(m_phys)}
+        del tapir;
+        gc.collect();
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"[!] TAPIR evaluation failed: {e}")
 
     return sim_results, real_results
 
@@ -186,10 +308,12 @@ def print_tables(sim_results, real_results):
     print(f"| {'Model Configuration':<40} | {'N-CoME (%)':<10} | {'Norm Jitter':<12} | {'KECS':<8} |")
     print("-" * 85)
 
-    order =[
+    order = [
         "Geometric Centroid (Naive Physics)",
         "Standard 3D-CNN (ResNet3D)",
         "Spatial Foundation (DINOv2)",
+        "Temporal Foundation (VideoMAE v2)",
+        "STATERA-1K-No-Z-Depth (Paradox Ablation)",
         "STATERA-1K-Frozen-Anchor",
         "STATERA-1K-Anchor",
         "STATERA-1K-Standard-Sigma",
@@ -209,12 +333,16 @@ def print_tables(sim_results, real_results):
         f"| {'Model Configuration':<38} | {'N-CoME (%)':<10} | {'Norm Jitter':<11} | {'KECS':<6} | {'Physics Capture':<18} |")
     print("-" * 105)
 
-    for name in order:
+    real_world_order = ["Point Tracker (CoTracker2)", "Point Tracker (TAPIR)"] + order
+
+    for name in real_world_order:
         if name in real_results:
             d = real_results[name]
             phys_str = f"{d['phys_cap'] * 100:.2f}%"
             if d['phys_cap'] > 1.0 or (name == "Standard 3D-CNN (ResNet3D)" and d['phys_cap'] > 0.30):
                 phys_str += " (Overshoot)"
+            elif d['phys_cap'] < 0:
+                phys_str += " (Collapse)"
             print(
                 f"| {name:<38} | {d['n_come'] * 100:>9.2f}% | {d['jitter']:>11.4f} | {d['kecs']:>6.4f} | {phys_str:<18} |")
     print("=" * 105 + "\n")
@@ -226,9 +354,13 @@ def print_tables(sim_results, real_results):
     print("-" * 85)
 
     # Short mappings meant specifically for extracting the Benchmark graph chart
-    chart_models =[
+    chart_models = [
         ("1K-DINOv2", "Spatial Foundation (DINOv2)"),
+        ("1K-VideoMAE", "Temporal Foundation (VideoMAE v2)"),
         ("1K-ResNet3D", "Standard 3D-CNN (ResNet3D)"),
+        ("1K-No-Z-Depth", "STATERA-1K-No-Z-Depth (Paradox Ablation)"),
+        ("Point-Tracker-Meta", "Point Tracker (CoTracker2)"),
+        ("Point-Tracker-Google", "Point Tracker (TAPIR)"),
         ("1K-Frozen-Anchor", "STATERA-1K-Frozen-Anchor"),
         ("1K-Anchor", "STATERA-1K-Anchor"),
         ("1K-Standard-Sigma", "STATERA-1K-Standard-Sigma"),
@@ -242,7 +374,7 @@ def print_tables(sim_results, real_results):
             kecs_val = real_results[full_name]['kecs']
             print(f"| {short_name:<25} | {n_come_val:<25.2f} | {kecs_val:<25.4f} |")
         else:
-             print(f"| {short_name:<25} | {'N/A':<25} | {'N/A':<25} |")
+            print(f"| {short_name:<25} | {'N/A':<25} | {'N/A':<25} |")
     print("=" * 85 + "\n")
 
 

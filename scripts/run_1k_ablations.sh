@@ -58,4 +58,10 @@ python tools/train.py --dataset_path sim/1K-ablation.hdf5 --decoder_type deconv 
 echo "[*] Launching Fully Frozen V-JEPA Ablation..."
 python tools/train.py --dataset_path sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone vjepa --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --temperature 2.0 --finetune_blocks 0 --save_checkpoint_every_epoch --checkpoint_dir .checkpoints --metrics_file .checkpoints/1k_ablation_metrics.json --wandb_name Run-08-Fully-Frozen-Anchor
 
+echo "[*] Launching VideoMAE v2 Baseline (Temporal Foundation)..."
+python tools/train.py --dataset_path sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone videomae --epochs 30 --funnel_epochs 6 --batch_size_override 1 --accumulate_steps 24 --temperature 2.0 --finetune_blocks 2 --save_checkpoint_every_epoch --checkpoint_dir .checkpoints --metrics_file .checkpoints/1k_ablation_metrics.json --wandb_name STATERA-1K-VideoMAE
+
+echo "[*] Launching Z-Depth Paradox Ablation (No Head B)..."
+python tools/train.py --dataset_path sim/1K-ablation.hdf5 --decoder_type deconv --temporal_mixer conv1d --target_type crescent --backbone vjepa --epochs 30 --funnel_epochs 6 --accumulate_steps 3 --single_task --temperature 2.0 --finetune_blocks 2 --save_checkpoint_every_epoch --checkpoint_dir .checkpoints --metrics_file .checkpoints/1k_ablation_metrics.json --wandb_name STATERA-1K-No-Z-Depth
+
 echo "[✓] ALL 1K ABLATIONS COMPLETE"

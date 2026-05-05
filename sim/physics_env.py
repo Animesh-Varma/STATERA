@@ -43,7 +43,6 @@ def project_point_to_2d(model, data, point_3d, camera_name="main_cam", resolutio
     return float(u), float(v), float(-pt_cam[2])
 
 
-# NEW: Calculates the dynamic 2D screen footprint of the 3D bounding box
 def get_projected_bbox_area(model, data, camera_name="main_cam", resolution=640):
     geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "shell")
     geom_type = model.geom_type[geom_id]
@@ -69,7 +68,7 @@ def get_projected_bbox_area(model, data, camera_name="main_cam", resolution=640)
     us, vs = [], []
     for pt in corners_world:
         u, v, z = project_point_to_2d(model, data, pt, camera_name=camera_name, resolution=resolution)
-        if z <= 0.15:  # Immediately reject if a corner comes within 15cm of the lens (will break projection)
+        if z <= 0.15:
             return float('inf')
         us.append(u)
         vs.append(v)

@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument('--temporal_mixer', type=str, default='conv1d', choices=['conv1d', 'transformer', 'none'])
     parser.add_argument('--target_type', type=str, default='dot',
                         choices=['dot', 'blend', 'crescent', 'twostage', 'dynamic_twostage'])
-    parser.add_argument('--backbone', type=str, default='vjepa', choices=['vjepa', 'dinov2', 'resnet3d'])
+    parser.add_argument('--backbone', type=str, default='vjepa', choices=['vjepa', 'dinov2', 'resnet3d', 'videomae'])
     parser.add_argument('--temporal_weighting', type=str, default='exponential', choices=['exponential', 'uniform'])
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'])
 
@@ -318,7 +318,13 @@ def main():
                         best_curriculum_loss = float('inf')
 
             if args.save_checkpoint_every_epoch:
-                ckpt_path = os.path.join(args.checkpoint_dir, f"{args.wandb_name}_epoch_{epoch + 1}.pth")
+                if (epoch + 1) == args.epochs:
+                    ckpt_path = os.path.join(args.checkpoint_dir, f"{args.wandb_name}.pth")
+                else:
+                    intermediate_dir = os.path.join(args.checkpoint_dir, f"{args.wandb_name}_intermediates")
+                    os.makedirs(intermediate_dir, exist_ok=True)
+                    ckpt_path = os.path.join(intermediate_dir, f"epoch_{epoch + 1}.pth")
+
                 torch.save(model.state_dict(), ckpt_path)
                 log(f"[✓] Saved checkpoint to: {ckpt_path}")
 

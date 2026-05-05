@@ -45,8 +45,6 @@ def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8):
 
 
 def generate_noise_based_com(shape_type, size_x, size_y, size_z):
-    # The Mass Distribution Fix: Uniformly spawn anywhere from 10% to 90% of the distance to the edge
-    # This samples uniformly across the radius (distance), removing extreme edge volumetric bias.
     extremity = np.random.uniform(0.1, 0.9)
 
     if shape_type in ["box", "beveled_box"]:
@@ -104,10 +102,8 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     is_close_target = random.random() < 0.15 and cam_mode != "STATIC"
 
-    # The Optics: Locked Camera FOV randomization strictly between [65, 85] degrees perfectly mimicking phone lenses
     camera_fovy = np.random.uniform(65, 85)
 
-    # The Scale Fix (Camera Distance): Randomize the physical distance of the camera from the object (0.5m to 4.0m)
     radius = np.random.uniform(0.5, 4.0)
 
     if cam_mode == "STATIC":
@@ -126,11 +122,9 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     floor_texture = random.choices(["checker", "gradient", "flat"], weights=[0.2, 0.4, 0.4])[0]
 
-    # The Textures: Heavy bias towards high-contrast macro-textures (like ArUco checkerboards) to prevent visual aliasing
     object_texture = random.choices(["checker", "gradient"], weights=[0.8, 0.2])[0]
     texrepeat_str = f"{random.choice([2, 3, 4])} {random.choice([2, 3, 4])}"
 
-    # Generate a stark contrasting secondary color based on luminance
     rgb1_parts = list(map(float, color_obj_rgb.split()))
     luminance = 0.299 * rgb1_parts[0] + 0.587 * rgb1_parts[1] + 0.114 * rgb1_parts[2]
     rgb2_obj = "0.05 0.05 0.05" if luminance > 0.5 else "0.95 0.95 0.95"
