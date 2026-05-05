@@ -1,3 +1,12 @@
+"""
+setup.py
+
+Bootstraps the STATERA experimental environment, enforces strict Python 3.12 requirements,
+and sequentially downloads the HiddenMass-50K dataset alongside the model checkpoints.
+Crucially includes an automated patch for a known PyTorch Hub localhost bug residing in the
+V-JEPA temporally-aware backbone repository.
+"""
+
 import sys
 import os
 import subprocess
@@ -100,7 +109,14 @@ def bootstrap():
 # 2. V-JEPA LOCALHOST BUG PATCHER
 # =================================================================
 def patch_and_download_vjepa():
-    """Fixes Meta's broken Torch Hub URL and pre-downloads the model weights in a clean process"""
+    """
+    Fixes Meta's broken Torch Hub URL and pre-downloads the model weights.
+
+    STATERA's core architecture relies heavily on Meta's V-JEPA 2.1 (ViT-L) backbone
+    to extract temporal tubelets and process transition dynamics. This script natively
+    patches the buggy localhost reference in the V-JEPA distribution to ensure the
+    temporally-aware foundation can be downloaded effectively for the experiments.
+    """
     print("\n[*] Initializing PyTorch Hub to patch Meta's V-JEPA2 localhost bug...")
     import torch
 
@@ -298,6 +314,9 @@ def run_setup():
         except Exception as e:
             print(f"    [!] Dataset download failed: {e}")
 
+        # The training dataset and combined ablations are immensely large (~50GB each).
+        # This setup exclusively downloads the HiddenMass-50K Public Test sequence to
+        # strictly reproduce the Context Tables from the paper without exhausting disk space.
         print("\n    [i] NOTE: The Training Dataset and combined 1K Ablation datasets")
         print("        are NOT downloaded by default due to immense size. You can")
         print("        download them manually from Hugging Face if you wish to train.")

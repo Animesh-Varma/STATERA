@@ -8,14 +8,21 @@ import h5py
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation as R
 
+
 def get_var(key, prompt_msg, cast_type, default):
+    """
+    Standard I/O utility to manage configuration variables.
+    Reads from a local 'variables.txt' cache to persist dataset parameters
+    across multiple physical sequence extractions.
+    """
     config_file = 'variables.txt'
     config = {}
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
-        except: pass
+        except:
+            pass
 
     if key not in config:
         val = input(f"{prompt_msg} (Default: {default}) -> ").strip()
@@ -24,7 +31,7 @@ def get_var(key, prompt_msg, cast_type, default):
         else:
             try:
                 if cast_type == list:
-                    config[key] =[float(x.strip()) for x in val.split(',')]
+                    config[key] = [float(x.strip()) for x in val.split(',')]
                 else:
                     config[key] = cast_type(val)
             except Exception:
@@ -41,6 +48,13 @@ def apply_savgol_kinematics(rvecs, tvecs, window_length=9, polyorder=3):
     """
     Applies independent linear smoothing to Translations, and
     mathematically safe Quaternion smoothing to Rotations.
+
+    PAPER CONNECTION (Appendix C):
+    Implements the "Quadratic Kinematic Regression filter to reduce high-frequency
+    sensor noise" referenced in the real-world dataset methodology. By operating
+    on continuous Quaternions instead of discontinuous Euler angles, it preserves
+    the smooth, differentiable transition dynamics of the object's momentum prior
+    to benchmarking STATERA.
     """
     # 1. Smooth Translations linearly
     smoothed_tvecs = np.zeros_like(tvecs)
@@ -52,8 +66,9 @@ def apply_savgol_kinematics(rvecs, tvecs, window_length=9, polyorder=3):
     quats = rotations.as_quat()  # Returns[x, y, z, w]
 
     # Enforce Quaternion continuity (prevent hemisphere flipping step-functions)
+    # This ensures smooth derivatives for Normalized Kinematic Jitter evaluation.
     for i in range(1, len(quats)):
-        if np.dot(quats[i], quats[i-1]) < 0:
+        if np.dot(quats[i], quats[i - 1]) < 0:
             quats[i] = -quats[i]
 
     # Smooth the continuous quaternion components
@@ -72,6 +87,15 @@ def apply_savgol_kinematics(rvecs, tvecs, window_length=9, polyorder=3):
 
 
 def clamp_com_to_polygon(pt, polygon):
+    """
+    Clamps the target Center of Mass 2D projection to the object's bounding polygon.
+
+    PAPER CONNECTION (Section 4.2):
+    This explicitly supports the calculation of the Normalized Center of Mass Error
+    (N-CoME). To prevent impossible Euclidean tracking penalties during extreme
+    perspective warps, the CoM is mathematically bounded by the object's 2D projected
+    diameter ($D_{bbox}$).
+    """
     pt_tuple = (float(pt[0]), float(pt[1]))
     if cv2.pointPolygonTest(polygon, pt_tuple, False) >= 0:
         return pt_tuple
@@ -83,7 +107,7 @@ def clamp_com_to_polygon(pt, polygon):
     pt_arr = np.array(pt_tuple)
     for i in range(n):
         a = polygon[i][0]
-        b = polygon[(i+1)%n][0]
+        b = polygon[(i + 1) % n][0]
 
         ab = b - a
         ap = pt_arr - a
@@ -101,14 +125,22 @@ def clamp_com_to_polygon(pt, polygon):
 
 
 def process_directory():
-    print("="*60)
+    """
+    PAPER CONNECTION (Section 4.3 & Appendix C):
+    The primary execution block responsible for generating the "millimeter-accurate
+    ground truth" for the zero-shot Real-World evaluation set (63 disjoint sequences,
+    1,008 frames). Operates the rigid anchoring of the external ArUco markers to the
+    hidden CoM via SQPnP estimation.
+    """
+    print("=" * 60)
     print(" STATERA: Kinematics Batch Extraction Setup (PHYSICS PATCHED)")
-    print("="*60)
+    print("=" * 60)
 
     marker_size_cm = get_var('marker_size_cm', 'Target black marker size in cm', float, 10.0)
-    box_size_cm = get_var('box_size_cm', 'Box dimensions X, Y, Z in cm', list,[15.0, 15.0, 15.0])
-    mujoco_com_offset_cm = get_var('com_offset_cm', 'MuJoCo Hidden CoM offset in cm', list,[4.0, -3.0, 5.0])
+    box_size_cm = get_var('box_size_cm', 'Box dimensions X, Y, Z in cm', list, [15.0, 15.0, 15.0])
+    mujoco_com_offset_cm = get_var('com_offset_cm', 'MuJoCo Hidden CoM offset in cm', list, [4.0, -3.0, 5.0])
 
+    # "T=16 represents a continuous trajectory sampled at 24 FPS" (Section 3.1)
     max_frames = get_var('max_frames', 'Number of strictly disjoint test frames per sequence', int, 16)
     stride = get_var('stride', 'Sliding Window Stride (Recommend 16 for testing)', int, 16)
     buffer_pad = get_var('buffer_pad', 'Padding frames on each side for Sav-Gol (Recommend 4)', int, 4)
@@ -125,23 +157,29 @@ def process_directory():
         print(f"[!] No .mp4 files found in '{input_dir}'. Exiting.")
         return
 
-    mj_x, mj_y, mj_z =[v / 100.0 for v in mujoco_com_offset_cm]
+    # PAPER CONNECTION (Appendix C): "SO(3) alignment matrix combined with a
+    # Cartesian reflection to resolve the coordinate chirality shift between the
+    # MuJoCo training environment (Z-Up) and the OpenCV physical projection matrix (Y-Down)"
+    mj_x, mj_y, mj_z = [v / 100.0 for v in mujoco_com_offset_cm]
     cv_x, cv_y, cv_z = -mj_x, -mj_z, mj_y
 
-    opencv_com_offset_m =[cv_x, cv_y, cv_z]
-    true_com_mag_m = math.sqrt(cv_x**2 + cv_y**2 + cv_z**2)
+    opencv_com_offset_m = [cv_x, cv_y, cv_z]
+    true_com_mag_m = math.sqrt(cv_x ** 2 + cv_y ** 2 + cv_z ** 2)
 
-    bx, by, bz =[v / 100.0 for v in box_size_cm]
+    bx, by, bz = [v / 100.0 for v in box_size_cm]
     hx, hy, hz = bx / 2, by / 2, bz / 2
     hm = (marker_size_cm / 100.0) / 2
 
+    # PAPER CONNECTION (Section 4.3): "utilizing exterior ArUco markers affixed to the rigid body"
+    # Note: These markers strictly serve as extrinsic ground-truth anchors and are never
+    # passed to STATERA during inference.
     DYNAMIC_MARKERS = {
-        0: [[-hm, -hm,  hz],[ hm, -hm,  hz], [ hm,  hm,  hz],[-hm,  hm,  hz]],
-        1: [[ hm, -hm, -hz],[-hm, -hm, -hz],[-hm,  hm, -hz], [ hm,  hm, -hz]],
-        2: [[-hx, -hm, -hm], [-hx, -hm,  hm],[-hx,  hm,  hm],[-hx,  hm, -hm]],
-        3: [[ hx, -hm,  hm],[ hx, -hm, -hm], [ hx,  hm, -hm],[ hx,  hm,  hm]],
-        4: [[-hm, -hy, -hm],[ hm, -hy, -hm],[ hm, -hy,  hm],[-hm, -hy,  hm]],
-        5: [[-hm,  hy,  hm], [ hm,  hy,  hm],[ hm,  hy, -hm], [-hm,  hy, -hm]]
+        0: [[-hm, -hm, hz], [hm, -hm, hz], [hm, hm, hz], [-hm, hm, hz]],
+        1: [[hm, -hm, -hz], [-hm, -hm, -hz], [-hm, hm, -hz], [hm, hm, -hz]],
+        2: [[-hx, -hm, -hm], [-hx, -hm, hm], [-hx, hm, hm], [-hx, hm, -hm]],
+        3: [[hx, -hm, hm], [hx, -hm, -hm], [hx, hm, -hm], [hx, hm, hm]],
+        4: [[-hm, -hy, -hm], [hm, -hy, -hm], [hm, -hy, hm], [-hm, -hy, hm]],
+        5: [[-hm, hy, hm], [hm, hy, hm], [hm, hy, -hm], [-hm, hy, -hm]]
     }
 
     print("\n[INFO] Loading Intrinsic Parameters...")
@@ -156,9 +194,10 @@ def process_directory():
     aruco_params = cv2.aruco.DetectorParameters()
     detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-    box_3d = np.array([[-hx, -hy, -hz],[hx, -hy, -hz], [hx, hy, -hz],[-hx, hy, -hz],
-        [-hx, -hy,  hz],[hx, -hy,  hz],[hx, hy,  hz], [-hx, hy,  hz]
-    ], dtype=np.float32)
+    # 3D bounding geometry for static fulcrum calculations
+    box_3d = np.array([[-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
+                       [-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]
+                       ], dtype=np.float32)
 
     com_3d = np.array([opencv_com_offset_m], dtype=np.float32)
 
@@ -173,12 +212,12 @@ def process_directory():
         h5_f = h5py.File(out_h5_path, 'w')
 
         h5_f.attrs["source_video"] = base_name
-        h5_f.attrs["box_size_m"] =[bx, by, bz]
+        h5_f.attrs["box_size_m"] = [bx, by, bz]
         h5_f.attrs["hidden_com_m"] = opencv_com_offset_m
         h5_f.attrs["com_magnitude_m"] = true_com_mag_m
-        h5_f.attrs["resolution"] =[384, 384]
+        h5_f.attrs["resolution"] = [384, 384]
 
-        raw_buffer =[]
+        raw_buffer = []
         original_frame_count = 0
         seq_idx = 0
         frame_h, frame_w = 0, 0
@@ -194,7 +233,7 @@ def process_directory():
             detection_success = False
 
             if ids is not None and len(ids) > 0:
-                obj_points, img_points = [],[]
+                obj_points, img_points = [], []
                 for i, marker_id in enumerate(ids):
                     mid = int(marker_id[0])
                     if mid in DYNAMIC_MARKERS:
@@ -214,7 +253,7 @@ def process_directory():
             if not detection_success:
                 if len(raw_buffer) > 0:
                     print(f"   [!] Lost tracking at frame {original_frame_count}. Resetting streak...")
-                raw_buffer =[]
+                raw_buffer = []
 
             if len(raw_buffer) == total_extract_len:
                 anchor_idx = 0
@@ -226,39 +265,44 @@ def process_directory():
 
                 poses = [None] * total_extract_len
 
-                # Solve Anchor
-                _, r_anch, t_anch = cv2.solvePnP(raw_buffer[anchor_idx]['obj_pts'], raw_buffer[anchor_idx]['img_pts'], mtx, dist, flags=cv2.SOLVEPNP_SQPNP)
+                # PAPER CONNECTION (Appendix C): "OpenCV's SQPnP" initialization step
+                _, r_anch, t_anch = cv2.solvePnP(raw_buffer[anchor_idx]['obj_pts'], raw_buffer[anchor_idx]['img_pts'],
+                                                 mtx, dist, flags=cv2.SOLVEPNP_SQPNP)
                 poses[anchor_idx] = (r_anch, t_anch)
 
+                # PAPER CONNECTION (Appendix C): "temporally anchored... and stateful extrinsic tracking" via `useExtrinsicGuess=True`
                 for i in range(anchor_idx + 1, total_extract_len):
-                    guess_r, guess_t = poses[i-1][0].copy(), poses[i-1][1].copy()
+                    guess_r, guess_t = poses[i - 1][0].copy(), poses[i - 1][1].copy()
                     _, r, t = cv2.solvePnP(raw_buffer[i]['obj_pts'], raw_buffer[i]['img_pts'], mtx, dist,
-                                           rvec=guess_r, tvec=guess_t, useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+                                           rvec=guess_r, tvec=guess_t, useExtrinsicGuess=True,
+                                           flags=cv2.SOLVEPNP_ITERATIVE)
                     poses[i] = (r, t)
 
-                # Track Backwards
+                # Track Backwards from the anchor frame to preserve pose continuity
                 for i in range(anchor_idx - 1, -1, -1):
-                    guess_r, guess_t = poses[i+1][0].copy(), poses[i+1][1].copy()
+                    guess_r, guess_t = poses[i + 1][0].copy(), poses[i + 1][1].copy()
                     _, r, t = cv2.solvePnP(raw_buffer[i]['obj_pts'], raw_buffer[i]['img_pts'], mtx, dist,
-                                           rvec=guess_r, tvec=guess_t, useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+                                           rvec=guess_r, tvec=guess_t, useExtrinsicGuess=True,
+                                           flags=cv2.SOLVEPNP_ITERATIVE)
                     poses[i] = (r, t)
 
                 rvecs = np.array([p[0].flatten() for p in poses])
                 tvecs = np.array([p[1].flatten() for p in poses])
 
                 # Proper Quaternion Math Smoothing applied here
+                # Enforces smooth derivatives, satisfying the Normalized Kinematic Jitter metric bounds
                 rvecs, tvecs = apply_savgol_kinematics(rvecs, tvecs, window_length=9, polyorder=3)
 
-                test_rvecs = rvecs[buffer_pad : buffer_pad + max_frames]
-                test_tvecs = tvecs[buffer_pad : buffer_pad + max_frames]
-                test_raw_buffer = raw_buffer[buffer_pad : buffer_pad + max_frames]
+                test_rvecs = rvecs[buffer_pad: buffer_pad + max_frames]
+                test_tvecs = tvecs[buffer_pad: buffer_pad + max_frames]
+                test_raw_buffer = raw_buffer[buffer_pad: buffer_pad + max_frames]
 
-                temp_buffer =[]
-                all_xs, all_ys = [],[]
+                temp_buffer = []
+                all_xs, all_ys = [], []
 
                 for i in range(max_frames):
-                    rvec = test_rvecs[i].reshape(3,1)
-                    tvec = test_tvecs[i].reshape(3,1)
+                    rvec = test_rvecs[i].reshape(3, 1)
+                    tvec = test_tvecs[i].reshape(3, 1)
 
                     box_2d, _ = cv2.projectPoints(box_3d, rvec, tvec, mtx, dist)
                     com_2d, _ = cv2.projectPoints(com_3d, rvec, tvec, mtx, dist)
@@ -279,24 +323,33 @@ def process_directory():
                         "original_idx": test_raw_buffer[i]["original_idx"]
                     })
 
-                cx, cy = (int(np.min(all_xs)) + int(np.max(all_xs))) // 2, (int(np.min(all_ys)) + int(np.max(all_ys))) // 2
+                # PAPER CONNECTION (Appendix C): "By centering a bounding box of fixed physical pixel dimensions
+                # on the visual centroid at each frame, we intentionally frame this as a local offset regression task."
+                cx, cy = (int(np.min(all_xs)) + int(np.max(all_xs))) // 2, (
+                            int(np.min(all_ys)) + int(np.max(all_ys))) // 2
                 target_size = min(frame_w, frame_h)
                 half_size = target_size // 2
                 x1, y1 = cx - half_size, cy - half_size
 
-                if x1 < 0: x1 = 0
-                elif x1 + target_size > frame_w: x1 = frame_w - target_size
+                if x1 < 0:
+                    x1 = 0
+                elif x1 + target_size > frame_w:
+                    x1 = frame_w - target_size
 
-                if y1 < 0: y1 = 0
-                elif y1 + target_size > frame_h: y1 = frame_h - target_size
+                if y1 < 0:
+                    y1 = 0
+                elif y1 + target_size > frame_h:
+                    y1 = frame_h - target_size
 
                 x2, y2 = x1 + target_size, y1 + target_size
                 scale = 384.0 / target_size
 
-                seq_frames, seq_u, seq_v, seq_z, seq_rvec, seq_tvec, seq_orig = [], [], [],[], [], [],[]
+                seq_frames, seq_u, seq_v, seq_z, seq_rvec, seq_tvec, seq_orig = [], [], [], [], [], [], []
 
                 for i, item in enumerate(temp_buffer):
                     crop_window = item["clean_frame"][y1:y2, x1:x2]
+
+                    # PAPER CONNECTION (Section 3.2): "Meta V-JEPA 2.1 (ViT-L, 384x384 input resolution)"
                     final_frame = cv2.resize(crop_window, (384, 384), interpolation=cv2.INTER_AREA)
 
                     final_com_u = (item["com_u"] - x1) * scale
@@ -305,7 +358,10 @@ def process_directory():
                     seq_frames.append(final_frame)
                     seq_u.append(final_com_u)
                     seq_v.append(final_com_v)
+
+                    # PAPER CONNECTION (Section 3.2): Target data for "a regularizing 1D Z-Depth scalar (Head B)."
                     seq_z.append(item["tvec"][2])
+
                     seq_rvec.append(item["rvec"])
                     seq_tvec.append(item["tvec"])
                     seq_orig.append(item["original_idx"])
@@ -314,7 +370,7 @@ def process_directory():
                 grp.create_dataset("frames", data=np.array(seq_frames, dtype=np.uint8), compression="lzf")
                 grp.create_dataset("com_u", data=np.array(seq_u, dtype=np.float32))
                 grp.create_dataset("com_v", data=np.array(seq_v, dtype=np.float32))
-                grp.create_dataset("z_depth_meters", data=np.array(seq_z, dtype=np.float32))
+                grp.create_dataset("z_depth_meters", data=np.array(seq_z, dtype=np.float32))  # Target for Head B
                 grp.create_dataset("rvecs", data=np.array(seq_rvec, dtype=np.float32))
                 grp.create_dataset("tvecs", data=np.array(seq_tvec, dtype=np.float32))
                 grp.create_dataset("original_video_frame", data=np.array(seq_orig, dtype=np.int32))
@@ -331,6 +387,7 @@ def process_directory():
         print(f"   [SUCCESS] Saved {seq_idx} pure test sequences to database: {out_h5_path}")
 
     print("\n[INFO] Batch processing complete!")
+
 
 if __name__ == "__main__":
     process_directory()

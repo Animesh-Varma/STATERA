@@ -3,8 +3,14 @@ import random
 import colorsys
 
 def get_contrasting_colors():
+    """
+    Generates domain-randomized, distinctly contrasting HSV-to-RGB color triplets for the sky,
+    floor, and object. This ensures visual distinctiveness and prevents feature collapse in the
+    downstream visual encoder, contributing to the robustness of the 2D keypoint extractions
+    prior to the SQPnP solver.
+    """
     hue_sky = random.random()
-    hue_floor = (hue_sky + random.uniform(0.33, 0.66)) % 1.0
+    hue_floor = (hue_sky + random.uniform(0.33, 0.66)) % 1.0 # WOHA-1
     hue_object = (hue_floor + random.uniform(0.33, 0.66)) % 1.0
 
     r_sky, g_sky, b_sky = colorsys.hsv_to_rgb(hue_sky, random.uniform(0.1, 0.3), random.uniform(0.6, 0.9))
@@ -16,12 +22,18 @@ def get_contrasting_colors():
             f"{r_obj:.3f} {g_obj:.3f} {b_obj:.3f}")
 
 
-def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8):
+def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8): # WOHA-2
+    """
+    Procedurally generates a beveled box mesh to simulate complex geometric contacts.
+    This mitigates the synthetic 'perfect-edge' bias typical in standard MuJoCo primitives,
+    providing a more realistic physical interaction for the CoM impact trajectories.
+    """
     hx = max(0.001, size_x - radius)
     hy = max(0.001, size_y - radius)
     hz = max(0.001, size_z - radius)
 
-    sphere_points = []
+    sphere_points =[]
+    # Generates a spherical octant for the corner beveling
     for i in range(resolution + 1):
         lat = (np.pi / 2) * (i / resolution)
         for j in range(resolution + 1):
@@ -31,7 +43,8 @@ def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8):
             z = np.sin(lat)
             sphere_points.append((x, y, z))
 
-    vertices = []
+    vertices =[]
+    # Mirrors the spherical octant across all 8 corners of the box bounds
     for sx in [-1, 1]:
         for sy in [-1, 1]:
             for sz in [-1, 1]:
@@ -45,28 +58,39 @@ def generate_beveled_box_mesh(size_x, size_y, size_z, radius, resolution=8):
 
 
 def generate_noise_based_com(shape_type, size_x, size_y, size_z):
+    """
+    Implements the 'Crescent target generation' strategy outlined in the paper.
+    By applying manifold-aware extremity sampling across different topological primitives,
+    we purposefully skew the Center of Mass (CoM) away from the geometric centroid.
+    This non-trivial displacement ensures the dynamics model genuinely learns inertial
+    correlations rather than collapsing to geometric priors.
+    """
     extremity = np.random.uniform(0.1, 0.9)
 
     if shape_type in ["box", "beveled_box"]:
         point = np.random.uniform(-extremity, extremity, 3)
         face = random.randint(0, 2)
+        # Forces the CoM perturbation toward the boundary of a randomly selected axis
         point[face] = extremity * random.choice([-1, 1])
         noise_x, noise_y, noise_z = point
 
     elif shape_type == "cylinder":
         if random.random() < 0.5:
+            # Radial disk bias
             theta = np.random.uniform(0, 2 * np.pi)
             r = extremity * np.sqrt(random.random())
             noise_x = r * np.cos(theta)
             noise_y = r * np.sin(theta)
             noise_z = extremity * random.choice([-1, 1])
         else:
+            # Cylindrical shell bias
             theta = np.random.uniform(0, 2 * np.pi)
             noise_x = extremity * np.cos(theta)
             noise_y = extremity * np.sin(theta)
             noise_z = np.random.uniform(-extremity, extremity)
 
     elif shape_type == "ellipsoid":
+        # Crescent sampling mapping on an ellipsoidal shell
         u = np.random.uniform(0, 1)
         v = np.random.uniform(0, 1)
         theta = 2 * np.pi * u
@@ -79,6 +103,11 @@ def generate_noise_based_com(shape_type, size_x, size_y, size_z):
 
 
 def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z):
+    """
+    Analytically derives the diagonal inertia tensor for the respective geometries.
+    Proper inertial anchoring is critical to ensure that the temporal 1D convolution
+    module evaluates physically valid angular momentum preservation during free-fall.
+    """
     if shape_type in ["box", "beveled_box"]:
         ix = (1 / 3) * mass * (size_y ** 2 + size_z ** 2)
         iy = (1 / 3) * mass * (size_x ** 2 + size_z ** 2)
@@ -95,7 +124,13 @@ def calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z):
 
 
 def generate_randomized_xml(cam_mode="STABLE"):
-    gravity_z = np.random.uniform(-9.834, -9.764)
+    """
+    Constructs the domain-randomized MuJoCo XML configuration.
+    The variance in damping, friction, mass, and scene lighting creates the heterogeneous
+    evaluation dataset required to benchmark the SQPnP solver's visual resilience and
+    the temporal dynamics predictions.
+    """
+    gravity_z = np.random.uniform(-9.834, -9.764) # WOHA-3
     air_density = np.random.uniform(1.1, 1.3)
 
     color_sky_rgb, color_floor_rgb, color_obj_rgb = get_contrasting_colors()
@@ -106,6 +141,7 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     radius = np.random.uniform(0.5, 4.0)
 
+    # Initial elevation bounds to guarantee initial free-fall before impact
     if cam_mode == "STATIC":
         drop_height = np.random.uniform(2.0, 5.0)
     elif is_close_target:
@@ -141,9 +177,11 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
     has_ramp = random.random() < 0.4
     ramp_euler = f"0 {np.random.uniform(10, 25):.1f} 0"
+    # Introduces sloped terrain to validate SQPnP pose estimation under complex rigid-body bouncing constraints
     ramp_geometry = f'<geom name="ramp" type="box" size="1.5 1.5 0.1" pos="0 0 0.0" euler="{ramp_euler}" material="mat_ramp" solref="{soft_solref}" solimp="{soft_solimp}" friction="{fric_str}" margin="0.002"/>' if has_ramp else ""
 
     distractors_xml = ""
+    # Adds visual clutter to strictly test the noise rejection capability of the feature extractor
     for _ in range(random.randint(1, 4)):
         dx, dy = np.random.uniform(-1.2, 1.2, 2)
         if abs(dx) < 0.4 and abs(dy) < 0.4: continue
@@ -192,6 +230,7 @@ def generate_randomized_xml(cam_mode="STABLE"):
         mesh_asset = ""
         geom_attributes = f'type="{shape_type}" size="{size_string}"'
 
+    # Extrude CoM according to the Crescent target generation principles
     com_x, com_y, com_z = generate_noise_based_com(shape_type, size_x, size_y, size_z)
     mass = np.random.uniform(1.5, 4.0)
     inertia_string = calculate_exact_inertia(shape_type, mass, size_x, size_y, size_z)
@@ -204,7 +243,7 @@ def generate_randomized_xml(cam_mode="STABLE"):
         <option gravity="0 0 {gravity_z:.4f}" timestep="0.001" solver="Newton" iterations="150" tolerance="1e-10" cone="elliptic" jacobian="dense" density="{air_density:.3f}" viscosity="1.8e-5"/>
 
         <visual>
-            <global fovy="{camera_fovy:.2f}" offwidth="640" offheight="640"/>
+            <global fovy="{camera_fovy:.2f}" offwidth="640" offheight="640"/> <!-- WOHA-4 -->
             <quality shadowsize="4096" offsamples="8"/>
         </visual>
         <asset>
@@ -240,6 +279,7 @@ def generate_randomized_xml(cam_mode="STABLE"):
 
             <body name="target_object" pos="0 0 {drop_height:.3f}">
                 <freejoint/>
+                <!-- Central dynamics tracking configuration mapping to the 1D temporal convolution bounds -->
                 <inertial pos="{com_x:.4f} {com_y:.4f} {com_z:.4f}" mass="{mass:.3f}" {inertia_string}/>
                 <geom name="shell" {geom_attributes} material="mat_obj" friction="{fric_str}" density="0" solref="{soft_solref}" solimp="{soft_solimp}" margin="0.002"/>
             </body>

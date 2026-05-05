@@ -6,6 +6,7 @@ import random
 import wandb
 from generator import generate_randomized_xml
 
+# Simulating hardware sensor artifacts to condition the feature extractor for downstream SQPnP execution
 frame_noise = A.Compose([
     A.MotionBlur(blur_limit=(7, 21), p=0.8),
     A.GaussNoise(std_range=(0.01, 0.04), p=0.7)
@@ -13,11 +14,16 @@ frame_noise = A.Compose([
 
 
 def apply_episode_white_balance(frames):
+    """
+    Simulates global lighting fluctuations across the image sequence.
+    This acts as dynamic exposure data augmentation, fortifying the 1D temporal convolution
+    against temporally inconsistent luminosity inputs.
+    """
     contrast = np.random.uniform(0.8, 1.2)
     brightness = np.random.uniform(-30, 30)
     r_shift, g_shift, b_shift = np.random.uniform(-20, 20, 3)
 
-    processed = []
+    processed =[]
     for f in frames:
         f = f.astype(np.float32) * contrast + brightness
         f[:, :, 0] += r_shift
@@ -28,6 +34,11 @@ def apply_episode_white_balance(frames):
 
 
 def project_point_to_2d(model, data, point_3d, camera_name="main_cam", resolution=640):
+    """
+    Projects 3D world coordinates to the 2D image plane using a strict pinhole camera model.
+    These absolute projections serve as the mathematical ground truth to evaluate the accuracy
+    of our SQPnP solver when reconstructing the 3D Center of Mass from 2D visual predictions.
+    """
     cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
     cam_pos = data.cam_xpos[cam_id]
     fovy = model.cam_fovy[cam_id]
@@ -44,6 +55,10 @@ def project_point_to_2d(model, data, point_3d, camera_name="main_cam", resolutio
 
 
 def get_projected_bbox_area(model, data, camera_name="main_cam", resolution=640):
+    """
+    Computes screen coverage to autonomously reject degenerate trajectory configurations
+    (e.g., lens clipping) that would otherwise poison the SQPnP keypoint distribution.
+    """
     geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "shell")
     geom_type = model.geom_type[geom_id]
     size = model.geom_size[geom_id]
@@ -57,15 +72,14 @@ def get_projected_bbox_area(model, data, camera_name="main_cam", resolution=640)
             sx = sy = sz = model.geom_rbound[geom_id]
 
     corners_local = np.array([
-        [ sx,  sy,  sz], [ sx,  sy, -sz], [ sx, -sy,  sz], [ sx, -sy, -sz],
-        [-sx,  sy,  sz], [-sx,  sy, -sz], [-sx, -sy,  sz], [-sx, -sy, -sz]
+        [ sx,  sy,  sz], [ sx,  sy, -sz],[ sx, -sy,  sz], [ sx, -sy, -sz],[-sx,  sy,  sz], [-sx,  sy, -sz], [-sx, -sy,  sz],[-sx, -sy, -sz]
     ])
 
     geom_pos = data.geom_xpos[geom_id]
     geom_mat = data.geom_xmat[geom_id].reshape(3, 3)
     corners_world = geom_pos + corners_local @ geom_mat.T
 
-    us, vs = [], []
+    us, vs = [],[]
     for pt in corners_world:
         u, v, z = project_point_to_2d(model, data, pt, camera_name=camera_name, resolution=resolution)
         if z <= 0.15:
@@ -78,6 +92,12 @@ def get_projected_bbox_area(model, data, camera_name="main_cam", resolution=640)
 
 
 def generate_statera_episode(dataset_file, episode_index):
+    """
+    Orchestrates the generation of an individual training episode.
+    It simulates physics, captures frames, isolates the critical impact event,
+    and slices the exact T=16 sequence length required as input for our
+    1D temporal convolution module.
+    """
     rand_mode = random.random()
     if rand_mode < 0.35:
         cam_mode = "STATIC"
@@ -111,9 +131,10 @@ def generate_statera_episode(dataset_file, episode_index):
             lookat_offset = np.random.uniform(-0.4, 0.4, 3)
             data.mocap_pos[mocap_id] = data.xpos[body_id].copy() + lookat_offset
 
-        frames, labels, geom_centers, z_heights = [], [], [], []
+        frames, labels, geom_centers, z_heights = [], [], [],[]
 
         for step in range(3000):
+            # Controls temporal tracking updates. Subsampling ensures non-trivial inter-frame dynamics
             if step % 10 == 0:
                 if cam_mode != "STATIC":
                     t = data.time
@@ -125,6 +146,8 @@ def generate_statera_episode(dataset_file, episode_index):
                         new_target = cam_target + 0.08 * (target_with_offset - cam_target)
                         jitter = np.zeros(3)
                     else:  # CHAOTIC
+                        # Applies multi-frequency chaotic jitter to benchmark the 1D temporal
+                        # convolution's resilience to high-frequency domain perturbations.
                         new_target = cam_target + 0.25 * (target_with_offset - cam_target)
                         jitter = np.array([
                             0.010 * np.sin(10 * t) + 0.005 * np.cos(23 * t),
@@ -138,8 +161,9 @@ def generate_statera_episode(dataset_file, episode_index):
             if data.warning[mujoco.mjtWarning.mjWARN_BADQACC].number > 0 or np.any(np.isnan(data.qvel)):
                 return False, None, None, None, None
 
+            # Frame extraction frequency mapping to the required temporal convolution sampling rate
             if step % 42 == 0:
-                # NEW: Dynamic rejection if the object exceeds 75% of a 384x384 box (110,592 pixels)
+                # Dynamic rejection if the object exceeds 75% of a 384x384 box (110,592 pixels)
                 bbox_area = get_projected_bbox_area(model, data, resolution=640)
                 if bbox_area > 110592:
                     return False, None, None, None, None
@@ -161,6 +185,7 @@ def generate_statera_episode(dataset_file, episode_index):
         impact_frame = 0
         is_falling = False
 
+        # Analyzes vertical velocity deltas to autonomously tag the primary impact frame
         for i in range(1, len(z_heights)):
             dz = z_heights[i] - z_heights[i - 1]
             if dz < -0.015:
@@ -176,6 +201,7 @@ def generate_statera_episode(dataset_file, episode_index):
         impact_offset = random.randint(3, 12)
         best_start = impact_frame - impact_offset
 
+        # Strict enforcement of the T=16 contiguous sequence length required by the architecture
         if best_start < 0 or best_start + 16 > len(frames):
             return False, None, None, None, None
 
@@ -246,9 +272,11 @@ if __name__ == "__main__":
         "attempts": 0,
         "successes": 0,
         "cam_modes": {"STATIC": 0, "STABLE": 0, "CHAOTIC": 0},
-        "impact_frames": []
+        "impact_frames":[]
     }
 
+    # HDF5 compilation specifically structured for highly optimized sequential data loading
+    # during the 1D Temporal Convolution Network's PyTorch dataloader phase.
     with h5py.File("1K-ablation.hdf5", "w") as f:
         f.create_dataset("videos",
                          shape=(NUM_EPISODES, 16, 3, 384, 384),
@@ -278,7 +306,7 @@ if __name__ == "__main__":
 
         episodes_generated = 0
         video_buffer = []
-        com_mag_list = []
+        com_mag_list =[]
 
         while episodes_generated < NUM_EPISODES:
             stats["attempts"] += 1
@@ -296,10 +324,10 @@ if __name__ == "__main__":
 
                 if episodes_generated % 1000 == 0:
                     wandb.log({
-                        "video_samples": [wandb.Video(v, fps=10, format="mp4") for v in video_buffer],
+                        "video_samples":[wandb.Video(v, fps=10, format="mp4") for v in video_buffer],
                         "step": episodes_generated
                     })
-                    video_buffer = []
+                    video_buffer =[]
 
         wandb.log({"com_magnitude_distribution": wandb.Histogram(com_mag_list)})
 
