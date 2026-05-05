@@ -20,3 +20,5 @@ imageio
 imageio-ffmpeg
 scipy
 tqdm
+huggingface_hub
+python-dotenv
